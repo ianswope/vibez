@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Search failures were reported as empty results** — `Search` queries the library, catalog songs, and catalog albums/playlists in parallel and only returned an error when all three failed, so one dead backend silently produced a thinner result set instead of a failure. Discovery refills then discarded the error entirely, leaving `[vibe] search error: no results` as the only clue. Partial failures are now carried on `SearchResult.Warnings`, logged as `[search] partial results: …`, and named in the "no results" message, so an unreachable backend is distinguishable from a query that genuinely matched nothing. Refs #93.
+
 ## [0.5.0] — 2026-07-10
 
 ### Added
