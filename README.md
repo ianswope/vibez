@@ -144,7 +144,13 @@ brew install --cask google-chrome
 git clone https://github.com/simonepelosi/vibez
 cd vibez
 make build-with-token   # requires APPLE_KEY_ID, APPLE_TEAM_ID, APPLE_PRIVATE_KEY
+make install            # same, plus copies the binary to ~/.local/bin
 ```
+
+`make install` reads those credentials from the environment or a gitignored
+`.env`, so the copy on your `PATH` is rebuilt rather than left to go stale.
+Embedded tokens expire after 30 days — re-run it when the catalog starts
+returning 401s. Override the location with `make install PREFIX=/usr/local`.
 
 **Requirements:** Linux x86-64 or arm64, or macOS · Go 1.26+ · WebKit/GStreamer development packages on Linux · Google Chrome on macOS · on Linux arm64, a system Chromium + Widevine CDM for full-track playback (e.g. `pacman -S chromium widevine`) · Apple Developer Account with a MusicKit key
 

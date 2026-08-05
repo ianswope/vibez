@@ -1,7 +1,9 @@
 GOFLAGS=-tags webkit2gtk_4_1
 PKG_CONFIG_PATH=$(CURDIR)/pkg-config
+PREFIX ?= $(HOME)/.local
+BINDIR ?= $(PREFIX)/bin
 
-.PHONY: build run test lint clean release build-with-token refresh-token
+.PHONY: build run test lint clean release build-with-token refresh-token install uninstall
 
 build:
 	PKG_CONFIG_PATH=$(PKG_CONFIG_PATH) go build -o vibez .
@@ -74,6 +76,32 @@ refresh-token:
 	test -n "$$APPLE_PRIVATE_KEY" || { echo "APPLE_PRIVATE_KEY or APPLE_PRIVATE_KEY_FILE is not set (env or .env)"; exit 1; }; \
 	export APPLE_KEY_ID APPLE_TEAM_ID APPLE_PRIVATE_KEY; \
 	GOFLAGS= go run ./scripts/gen-devtoken -write
+
+# install rebuilds with an embedded developer token and copies the binary onto
+# PATH, so the installed copy cannot silently go stale behind a newer ./vibez in
+# the working tree. Credentials come from the environment or a local .env
+# (gitignored), which may point at the key with APPLE_PRIVATE_KEY_FILE instead
+# of inlining its contents as APPLE_PRIVATE_KEY — the same inputs refresh-token
+# accepts.
+#
+# Embedded tokens expire after 30 days, so re-run this when the catalog starts
+# returning 401s. Override the location with: make install PREFIX=/usr/local
+install:
+	@set -e; \
+	if [ -f .env ]; then set -a; . ./.env; set +a; fi; \
+	if [ -z "$$APPLE_PRIVATE_KEY" ] && [ -n "$$APPLE_PRIVATE_KEY_FILE" ]; then \
+		key_file="$$(eval echo $$APPLE_PRIVATE_KEY_FILE)"; \
+		test -f "$$key_file" || { echo "APPLE_PRIVATE_KEY_FILE not found: $$key_file"; exit 1; }; \
+		APPLE_PRIVATE_KEY="$$(cat "$$key_file")"; \
+	fi; \
+	export APPLE_KEY_ID APPLE_TEAM_ID APPLE_PRIVATE_KEY LASTFM_API_KEY LASTFM_API_SECRET; \
+	$(MAKE) --no-print-directory build-with-token; \
+	install -d "$(BINDIR)"; \
+	install -m 755 vibez "$(BINDIR)/vibez"; \
+	echo "Installed vibez to $(BINDIR)/vibez"
+
+uninstall:
+	rm -f "$(BINDIR)/vibez"
 
 run: build
 	./vibez
