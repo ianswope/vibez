@@ -232,7 +232,7 @@ func (p *Player) eosLoop() {
 }
 
 //export vibezOnEOS
-func vibezOnEOS(ptr unsafe.Pointer) {
+func vibezOnEOS(h C.uintptr_t) {
 	p := cgo.Handle(uintptr(h)).Value().(*Player)
 	select {
 	case p.eosCh <- struct{}{}:
@@ -444,6 +444,15 @@ func (p *Player) AppendQueue(ids []string) error {
 func (p *Player) SetRepeat(mode int) error {
 	p.mu.Lock()
 	p.state.RepeatMode = mode
+	p.mu.Unlock()
+	return nil
+}
+
+// SCAFFOLDING ONLY (not proposed code) — minimal SetShuffle so the darwin build
+// satisfies player.Player and the runtime matrix can be exercised.
+func (p *Player) SetShuffle(on bool) error {
+	p.mu.Lock()
+	p.state.ShuffleMode = on
 	p.mu.Unlock()
 	return nil
 }
