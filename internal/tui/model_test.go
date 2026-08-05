@@ -585,14 +585,14 @@ func TestModel_RenderHeader_ContainsVibez(t *testing.T) {
 	}
 }
 
-// --- statusNavContent ---
+// --- statusNavLines ---
 
 func TestModel_RenderFooter_ContainsKeyHints(t *testing.T) {
 	m := newModel(nil)
 	m.width = 100
-	got := m.statusNavContent(m.width - 4)
+	got := strings.Join(m.statusNavLines(m.width-4), "\n")
 	if !strings.Contains(got, "search") {
-		t.Errorf("statusNavContent() should contain key hints, got %q", got)
+		t.Errorf("statusNavLines() should contain key hints, got %q", got)
 	}
 }
 

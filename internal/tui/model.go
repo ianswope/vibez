@@ -12,6 +12,7 @@ import (
 
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
+	"github.com/charmbracelet/x/ansi"
 	"github.com/simone-vibes/vibez/internal/audioquality"
 	"github.com/simone-vibes/vibez/internal/config"
 	"github.com/simone-vibes/vibez/internal/lyrics"
@@ -2948,9 +2949,10 @@ func (m *Model) renderBoxLayout() string {
 		sb.WriteString("├" + strings.Repeat("─", splitW) + "┴" + strings.Repeat("─", rightW) + "┤\n")
 	}
 
-	// ── Status bar (two lines: context/mode + playback) ──
-	sb.WriteString("│ " + padRight(m.statusNavContent(inner-2), inner-2) + " │\n")
-	sb.WriteString("│ " + padRight(m.statusPlayContent(inner-2), inner-2) + " │\n")
+	// ── Status bar (context/mode then playback, each wrapped as needed) ──
+	for _, line := range m.statusLines(inner - 2) {
+		sb.WriteString("│ " + padRight(line, inner-2) + " │\n")
+	}
 
 	// ── Bottom border ──
 	sb.WriteString("└" + strings.Repeat("─", inner) + "┘")
@@ -3258,8 +3260,9 @@ func (m *Model) searchLines(contentW, h int) []string {
 	return result[:h]
 }
 
-// statusNavContent is the top status line: mode chip + context-aware shortcuts.
-func (m *Model) statusNavContent(_ int) string {
+// statusNavLines is the top status line: mode chip + context-aware shortcuts,
+// wrapped to fit width w.
+func (m *Model) statusNavLines(w int) []string {
 	muted := styles.QueueItemMuted
 	accent := styles.KeyName
 	dot := muted.Render("  ·  ")
@@ -3270,12 +3273,12 @@ func (m *Model) statusNavContent(_ int) string {
 		cur := min(m.searchCursor, len(runes))
 		before := styles.Header.Render(string(runes[:cur]))
 		after := styles.Header.Render(string(runes[cur:]))
-		return styles.ModeSearch.Render("SEARCH") + "  " +
-			accent.Render("/") + before + accent.Render("█") + after
+		return []string{styles.ModeSearch.Render("SEARCH") + "  " +
+			accent.Render("/") + before + accent.Render("█") + after}
 	case modeCommand:
-		return styles.ModeCommand.Render("CMD") + "  " +
+		return []string{styles.ModeCommand.Render("CMD") + "  " +
 			muted.Render(":") + m.cmdBuf + accent.Render("_") +
-			muted.Render("  Tab complete · ↑/↓ navigate · Esc cancel")
+			muted.Render("  Tab complete · ↑/↓ navigate · Esc cancel")}
 	default:
 		var parts []string
 		switch {
@@ -3357,12 +3360,13 @@ func (m *Model) statusNavContent(_ int) string {
 				accent.Render(":q") + muted.Render(" quit"),
 			}
 		}
-		return strings.Join(parts, dot)
+		return wrapFit(parts, dot, w)
 	}
 }
 
-// statusPlayContent is the bottom status line: always shows playback controls.
-func (m *Model) statusPlayContent(_ int) string {
+// statusPlayLines is the bottom status line: always shows playback controls,
+// wrapped to fit width w.
+func (m *Model) statusPlayLines(w int) []string {
 	muted := styles.QueueItemMuted
 	accent := styles.KeyName
 	dot := muted.Render("  ·  ")
@@ -3389,7 +3393,7 @@ func (m *Model) statusPlayContent(_ int) string {
 		discoverHint,
 		radioHint,
 	}
-	return strings.Join(parts, dot)
+	return wrapFit(parts, dot, w)
 }
 
 // commandLines renders the command palette in the panel area when CMD mode is active.
@@ -3425,21 +3429,69 @@ func (m *Model) commandLines(_ int, h int) []string {
 	return result[:h]
 }
 
+// statusLines returns every status row — nav hints then playback controls —
+// each already wrapped to fit width w. The count varies with terminal width,
+// so panelHeight consults it rather than assuming a fixed two rows.
+func (m *Model) statusLines(w int) []string {
+	return append(m.statusNavLines(w), m.statusPlayLines(w)...)
+}
+
 // panelHeight returns the number of rows available for the split panel section.
-// Fixed overhead = top(1)+hdr(1)+hdrdiv(1)+np(12)+splitdiv(1)+joindiv(1)+status(2)+bottom(1) = 20.
+// Fixed overhead = top(1)+hdr(1)+hdrdiv(1)+np(12)+splitdiv(1)+joindiv(1)+bottom(1) = 18,
+// plus the status rows, which grow as hints wrap on a narrow terminal.
 func (m *Model) panelHeight() int {
-	return max(3, m.height-20)
+	return max(3, m.height-18-len(m.statusLines(m.width-4)))
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────
 
-// padRight pads s on the right with spaces to reach visual width w.
+// padRight pads s on the right with spaces to reach visual width w, and clips
+// it when it is wider. Clipping is the backstop that keeps an over-long line
+// from pushing past the right border and breaking the vertical rule; it is
+// ANSI-aware so styled content is never cut mid-escape-sequence.
 func padRight(s string, w int) string {
-	sw := lipgloss.Width(s)
-	if sw >= w {
-		return s
+	if w <= 0 {
+		return ""
 	}
-	return s + strings.Repeat(" ", w-sw)
+	sw := lipgloss.Width(s)
+	switch {
+	case sw > w:
+		return ansi.Truncate(s, w, "…")
+	case sw == w:
+		return s
+	default:
+		return s + strings.Repeat(" ", w-sw)
+	}
+}
+
+// wrapFit packs parts into as many lines as needed, each at most visual width
+// w, joining the parts on a line with sep. Nothing is ever hidden: a narrow
+// terminal costs extra rows rather than dropped hints. Parts are never split,
+// so styled segments stay intact — a lone part wider than w gets its own line
+// and is clipped by padRight. Always returns at least one line.
+func wrapFit(parts []string, sep string, w int) []string {
+	if len(parts) == 0 || w <= 0 {
+		return []string{""}
+	}
+
+	sepW := lipgloss.Width(sep)
+	var lines []string
+	cur, curW := "", 0
+
+	for _, p := range parts {
+		pw := lipgloss.Width(p)
+		switch {
+		case cur == "":
+			cur, curW = p, pw
+		case curW+sepW+pw <= w:
+			cur += sep + p
+			curW += sepW + pw
+		default:
+			lines = append(lines, cur)
+			cur, curW = p, pw
+		}
+	}
+	return append(lines, cur)
 }
 
 // toLines splits s into exactly h lines, padding/truncating as needed.
