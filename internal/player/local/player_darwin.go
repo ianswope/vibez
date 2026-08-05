@@ -165,21 +165,21 @@ import (
 
 // Player implements player.Player for local audio files using CoreAudio
 type Player struct {
-	mu    sync.RWMutex
-	state player.State
-	subs  []chan player.State
-	queue []provider.Track
-	idx   int
-	audio *C.vibez_audio_state
-	done  chan struct{}
-	eosCh chan struct{}
+	mu     sync.RWMutex
+	state  player.State
+	subs   []chan player.State
+	queue  []provider.Track
+	idx    int
+	audio  *C.vibez_audio_state
+	done   chan struct{}
+	eosCh  chan struct{}
 	handle cgo.Handle
 }
 
 // New creates a local Player backed by CoreAudio
 func New() (*Player, error) {
 	p := &Player{
-		done: make(chan struct{}),
+		done:  make(chan struct{}),
 		eosCh: make(chan struct{}, 1),
 	}
 	go p.pollState()
@@ -220,9 +220,9 @@ func (p *Player) broadcast(s player.State) {
 	}
 }
 
-func (p *Player) eosLoop(){
-	for{
-		select{
+func (p *Player) eosLoop() {
+	for {
+		select {
 		case <-p.eosCh:
 			_ = p.Next()
 		case <-p.done:
@@ -232,9 +232,9 @@ func (p *Player) eosLoop(){
 }
 
 //export vibezOnEOS
-func vibezOnEOS(ptr unsafe.Pointer) {
-	handle := cgo.Handle(h)
-	p := handle.Value().(*Player)
+func vibezOnEOS(handle C.uintptr_t) {
+	h := cgo.Handle(uintptr(handle))
+	p := h.Value().(*Player)
 	select {
 	case p.eosCh <- struct{}{}:
 	default:
@@ -445,6 +445,13 @@ func (p *Player) AppendQueue(ids []string) error {
 func (p *Player) SetRepeat(mode int) error {
 	p.mu.Lock()
 	p.state.RepeatMode = mode
+	p.mu.Unlock()
+	return nil
+}
+
+func (p *Player) SetShuffle(on bool) error {
+	p.mu.Lock()
+	p.state.ShuffleMode = on
 	p.mu.Unlock()
 	return nil
 }
