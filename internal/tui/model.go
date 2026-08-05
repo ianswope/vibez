@@ -3265,7 +3265,7 @@ func (m *Model) searchLines(contentW, h int) []string {
 func (m *Model) statusNavLines(w int) []string {
 	muted := styles.QueueItemMuted
 	accent := styles.KeyName
-	dot := muted.Render("  ·  ")
+	dot := muted.Render(" · ")
 
 	switch m.mode {
 	case modeSearch:
@@ -3348,13 +3348,13 @@ func (m *Model) statusNavLines(w int) []string {
 		default:
 			parts = []string{
 				styles.ModeNormal.Render("NORMAL"),
-				accent.Render(":") + muted.Render(" command"),
+				accent.Render(":") + muted.Render(" cmd"),
 				accent.Render("/") + muted.Render(" search"),
 				accent.Render("l") + muted.Render(" library"),
 				accent.Render("q") + muted.Render(" queue"),
 				accent.Render("y") + muted.Render(" lyrics"),
 				accent.Render("F") + muted.Render(" feed"),
-				accent.Render("e") + muted.Render(" equalizer"),
+				accent.Render("e") + muted.Render(" eq"),
 				accent.Render("v") + muted.Render(" vibe"),
 				accent.Render("?") + muted.Render(" about"),
 				accent.Render(":q") + muted.Render(" quit"),
@@ -3369,7 +3369,7 @@ func (m *Model) statusNavLines(w int) []string {
 func (m *Model) statusPlayLines(w int) []string {
 	muted := styles.QueueItemMuted
 	accent := styles.KeyName
-	dot := muted.Render("  ·  ")
+	dot := muted.Render(" · ")
 
 	discoverHint := accent.Render("d") + muted.Render(" metric")
 	if m.discovery.enabled {
@@ -3386,7 +3386,7 @@ func (m *Model) statusPlayLines(w int) []string {
 	parts := []string{
 		accent.Render("spc") + muted.Render(" play/pause"),
 		accent.Render("n/p") + muted.Render(" next/prev"),
-		accent.Render("←/→") + muted.Render(" seek ±10s"),
+		accent.Render("←/→") + muted.Render(" seek"),
 		accent.Render("f") + muted.Render(" fav"),
 		accent.Render("s") + muted.Render(" shuffle"),
 		accent.Render("r") + muted.Render(" repeat"),
