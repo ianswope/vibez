@@ -402,6 +402,8 @@ func runPlaywright() (*playwright.Playwright, error) {
 	pw, err := playwright.Run(&playwright.RunOptions{
 		DriverDirectory:     driverDir(),
 		SkipInstallBrowsers: true,
+		Stderr:              driverStderr(),
+		Logger:              driverLogger(),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("playwright driver: %w", err)
