@@ -301,6 +301,40 @@ func TestSave_WithOverridePath(t *testing.T) {
 	}
 }
 
+func TestSave_UsesLoadedOverrideWhenPathOmitted(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	override := writeCfg(t, map[string]any{
+		"storefront": "us",
+		"auth_port":  7777,
+		"provider":   "apple",
+	})
+
+	cfg, err := config.Load(override)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	cfg.StoreFront = "gb"
+	if err := cfg.Save(""); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	data, err := os.ReadFile(override) //nolint:gosec // test fixture
+	if err != nil {
+		t.Fatalf("reading override: %v", err)
+	}
+	if !strings.Contains(string(data), `"storefront": "gb"`) {
+		t.Fatalf("override was not updated: %s", data)
+	}
+
+	defaultPath, err := config.ConfigPath("")
+	if err != nil {
+		t.Fatalf("ConfigPath: %v", err)
+	}
+	if _, err := os.Stat(defaultPath); !os.IsNotExist(err) {
+		t.Fatalf("Save created default config %q; stat error = %v", defaultPath, err)
+	}
+}
+
 func TestAudioQualityDefaultsHigh(t *testing.T) {
 	path := writeCfg(t, map[string]any{"storefront": "us"})
 	cfg, err := config.Load(path)

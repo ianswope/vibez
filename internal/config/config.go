@@ -10,6 +10,11 @@ import (
 )
 
 type Config struct {
+	// path remembers where this config was loaded from. It is deliberately not
+	// serialized; it only ensures that Save("") persists back to the selected
+	// --config file instead of silently falling back to the default profile.
+	path string
+
 	AppleDeveloperToken string `json:"apple_developer_token"`
 	AppleUserToken      string `json:"apple_user_token"`
 	AppleKeyID          string `json:"apple_key_id"`
@@ -99,6 +104,7 @@ func Load(override string) (*Config, error) {
 	data, err := os.ReadFile(path) //nolint:gosec // path comes from user config, not external input
 	if os.IsNotExist(err) {
 		cfg := defaults()
+		cfg.path = path
 		if saveErr := cfg.save(path); saveErr != nil {
 			return nil, fmt.Errorf("creating default config: %w", saveErr)
 		}
@@ -113,6 +119,7 @@ func Load(override string) (*Config, error) {
 	if err := json.Unmarshal(data, cfg); err != nil {
 		return nil, fmt.Errorf("parsing config: %w", err)
 	}
+	cfg.path = path
 	cfg.normalize()
 	return cfg, nil
 }
@@ -132,11 +139,22 @@ func (c *Config) normalize() {
 }
 
 func (c *Config) Save(override string) error {
-	path, err := ConfigPath(override)
-	if err != nil {
+	path := override
+	if path == "" {
+		path = c.path
+	}
+	if path == "" {
+		var err error
+		path, err = ConfigPath("")
+		if err != nil {
+			return err
+		}
+	}
+	if err := c.save(path); err != nil {
 		return err
 	}
-	return c.save(path)
+	c.path = path
+	return nil
 }
 
 func (c *Config) save(path string) error {
