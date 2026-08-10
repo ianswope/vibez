@@ -1,0 +1,286 @@
+<!DOCTYPE html>
+<!--
+  PROTOTYPE INSTRUMENT — issue #96 phase E (dual instance). Not shipped.
+
+  Phases A-D established that ONE MusicKit instance cannot close the boundary
+  gap: it reuses a single media element, swaps src on it, and ~260ms of the
+  residual is decoder/licence readiness that only starts once the previous
+  track releases the element. No prepare/preload API exists on any of the 88
+  enumerated members.
+
+  This probe breaks that constraint instead of working inside it. Two MusicKit
+  instances live in two same-origin iframes, so there are two independent media
+  elements. The next track is primed to readyState 4 WHILE the current one is
+  still playing, moving every expensive step off the boundary. What remains at
+  the switch is starting an element that is already decoded and licensed.
+
+  Three questions, in order of what would kill the idea soonest:
+
+    E1  Will Apple even allow two concurrent authenticated sessions? A primed
+        second instance holds a stream. If Apple refuses, or kills the first,
+        the design is dead regardless of how good the timing is.
+    E2  With the next track primed, how long is the hand-off? This is the
+        number that decides whether "gapless" is honest.
+    E3  Can the two overlap deliberately (start early muted, swap gain)? DRM
+        blocks Web Audio sample access, but element.volume is unaffected.
+        Records the cost as well as the benefit: starting early means the
+        incoming track's first EARLY_MS are layered under the outgoing tail.
+
+  Everything is reported as JSON via goProbeResult(). No behavioural claims —
+  it records what happened.
+-->
+<html>
+  <head><meta charset="utf-8"><title>vibez dual-instance probe</title></head>
+  <body>
+    <script>
+      window.addEventListener('error', (e) => window.__fail?.(e.message || 'window error'));
+      window.addEventListener('unhandledrejection', (e) => window.__fail?.(String(e.reason)));
+    </script>
+    <script>
+      (async function () {
+        const RESULT = { phases: [], errors: [], config: {} };
+        const fail = (stage, e) => RESULT.errors.push({
+          stage, error: (e && (e.name ? e.name + ': ' + (e.message || '') : e.message)) || String(e),
+        });
+        let flushed = false;
+        const flush = () => { if (flushed) return; flushed = true; goProbeResult(JSON.stringify(RESULT)).catch(() => {}); };
+        window.__fail = (m) => { fail('window', m); flush(); };
+
+        const IDS      = {{.IDsJSON}};
+        const LEAD_S   = {{.LeadSeconds}};
+        const TAIL_MS  = {{.TailMs}};
+        const EARLY_MS = {{.EarlyMs}};
+        RESULT.config = { ids: IDS, leadSeconds: LEAD_S, tailMs: TAIL_MS, earlyMs: EARLY_MS };
+
+        const STATE = ['none','loading','playing','paused','stopped','ended','seekFwd','seekBwd','waiting','completed','completed'];
+        const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+        const waitFor = (pred, ms) => new Promise(res => {
+          const iv = setInterval(() => { let v = false; try { v = pred(); } catch (_) {} if (v) { clearInterval(iv); clearTimeout(to); res(true); } }, 20);
+          const to = setTimeout(() => { clearInterval(iv); res(false); }, ms);
+        });
+
+        // ── two instances, two browsing contexts ──────────────────────────
+        const mkFrame = (name) => new Promise((res, rej) => {
+          const f = document.createElement('iframe');
+          f.style.cssText = 'width:1px;height:1px;border:0;position:absolute;left:-9999px';
+          f.src = '/frame?n=' + name;
+          f.onload = async () => {
+            const ok = await waitFor(() => f.contentWindow.__ready || f.contentWindow.__error, 30000);
+            if (!ok) return rej(new Error(name + ': frame never became ready'));
+            if (f.contentWindow.__error) return rej(new Error(name + ': ' + f.contentWindow.__error));
+            res(f);
+          };
+          document.body.appendChild(f);
+        });
+
+        let A, B;
+        try {
+          [A, B] = await Promise.all([mkFrame('A'), mkFrame('B')]);
+        } catch (e) { fail('frames', e); flush(); return; }
+
+        const mkOf = (f) => f.contentWindow.MusicKit.getInstance();
+        const elOf = (f) => { try { return f.contentDocument.querySelector('audio,video'); } catch (_) { return null; } };
+        const setVol = (f, v) => { const el = elOf(f); if (el) el.volume = v; };
+
+        const snap = (f) => {
+          let mk = null; try { mk = mkOf(f); } catch (_) {}
+          const el = elOf(f);
+          return {
+            st: mk ? (STATE[mk.playbackState] ?? mk.playbackState) : null,
+            item: mk?.nowPlayingItem?.id ?? null,
+            ct: el ? +(el.currentTime || 0).toFixed(3) : null,
+            paused: el ? !!el.paused : null,
+            ready: el ? el.readyState : null,
+            vol: el ? +el.volume.toFixed(2) : null,
+            buf: (el && el.buffered && el.buffered.length) ? +el.buffered.end(el.buffered.length - 1).toFixed(2) : null,
+            src: el ? ((el.currentSrc || '').slice(-24) || null) : null,
+          };
+        };
+
+        // 25ms sampling: the whole point is resolving a hand-off that may be
+        // shorter than one frame of the 50ms loop used in phases A-D.
+        let tl = [], t0 = 0, poll = null;
+        const startRec = () => { tl = []; t0 = performance.now(); poll = setInterval(() => {
+          tl.push({ t: +(performance.now() - t0).toFixed(1), a: snap(A), b: snap(B) });
+        }, 25); };
+        const stopRec = () => { clearInterval(poll); return tl.slice(); };
+
+        // Audio is "advancing" on a side when currentTime moves on an unpaused
+        // element whose src has not changed since the previous sample.
+        const advancing = (cur, prev, side) => {
+          const c = cur[side], p = prev[side];
+          if (!c || !p || c.ct === null || p.ct === null) return false;
+          return c.src === p.src && !c.paused && (c.ct - p.ct) > 0.002;
+        };
+        // gapMs is signed: negative means the incoming track was already
+        // producing audio before the outgoing one stopped, i.e. real overlap.
+        const derive = (tlx, from, to) => {
+          let lastFrom = null, firstTo = null, overlap = 0, prev = null;
+          for (const e of tlx) {
+            if (prev) {
+              const af = advancing(e, prev, from), at = advancing(e, prev, to);
+              if (af) lastFrom = e.t;
+              if (at && firstTo === null) firstTo = e.t;
+              if (af && at) overlap += e.t - prev.t;
+            }
+            prev = e;
+          }
+          return (lastFrom !== null && firstTo !== null)
+            ? { gapMs: +(firstTo - lastFrom).toFixed(1), lastAdvanceFrom: lastFrom, firstAdvanceTo: firstTo, overlapMs: +overlap.toFixed(1) }
+            : { gapMs: null, lastAdvanceFrom: lastFrom, firstAdvanceTo: firstTo, overlapMs: +overlap.toFixed(1),
+                note: 'could not observe audio advancing on both instances' };
+        };
+
+        // Warm an instance to readyState 4 and park it at position 0, silent.
+        // This is the entire trick: decode + licence happen here, seconds
+        // before the boundary, on an element nothing else is using.
+        const prime = async (f, id) => {
+          const mk = mkOf(f);
+          await mk.setQueue({ songs: [id] });
+          setVol(f, 0);
+          await mk.play();
+          const warmed = await waitFor(() => { const el = elOf(f); return el && el.readyState >= 4 && el.currentTime > 0.25; }, 25000);
+          setVol(f, 0);
+          try { await mk.pause(); } catch (_) {}
+          try { mk.seekToTime(0); } catch (_) {}
+          await waitFor(() => { const el = elOf(f); return el && el.currentTime < 0.4; }, 4000);
+          const el = elOf(f);
+          return {
+            warmed,
+            ready: el ? el.readyState : null,
+            bufferedSec: (el && el.buffered && el.buffered.length) ? +el.buffered.end(el.buffered.length - 1).toFixed(2) : null,
+            parkedAt: el ? +el.currentTime.toFixed(3) : null,
+          };
+        };
+
+        const seekNearEnd = (f) => {
+          const mk = mkOf(f);
+          const dur = (mk.nowPlayingItem?.attributes?.durationInMillis ?? 0) / 1000;
+          if (dur > LEAD_S + 2) mk.seekToTime(Math.max(0, dur - LEAD_S));
+        };
+
+        try {
+          // ── E1 — will Apple allow two live sessions at once? ─────────────
+          // Start A playing, then prime B while A keeps going. If Apple
+          // enforces one stream per account, A stalls or errors here.
+          await mkOf(A).setQueue({ songs: [IDS[0]] });
+          setVol(A, 1);
+          await mkOf(A).play();
+          const aPlaying = await waitFor(() => { const el = elOf(A); return el && !el.paused && el.currentTime > 0.5; }, 25000);
+
+          const beforePrime = snap(A);
+          const primeB = await prime(B, IDS[1]);
+          await sleep(400);
+          const afterPrime = snap(A);
+          const aSurvived = afterPrime.ct !== null && beforePrime.ct !== null &&
+                            afterPrime.ct > beforePrime.ct && !afterPrime.paused;
+
+          RESULT.phases.push({
+            phase: 'E1-concurrent-sessions',
+            aStartedPlaying: aPlaying,
+            aKeptPlayingWhileBPrimed: aSurvived,
+            aBefore: beforePrime, aAfter: afterPrime,
+            bPrime: primeB,
+            distinctMediaElements: elOf(A) !== elOf(B) && !!elOf(A) && !!elOf(B),
+          });
+
+          // ── E2 — primed hand-off ─────────────────────────────────────────
+          // B is decoded, licensed and parked at 0. Start it the instant A's
+          // element reports ended. Nothing expensive is left to do.
+          let handoffRan = false;
+          if (aSurvived && primeB.warmed) {
+            handoffRan = true;
+            startRec();
+            seekNearEnd(A);
+            let fired = null;
+            const handoff = () => {
+              if (fired !== null) return;
+              fired = +(performance.now() - t0).toFixed(1);
+              setVol(B, 1);
+              try { mkOf(B).play(); } catch (e) { fail('handoff', e); }
+            };
+            const elA = elOf(A);
+            if (elA) elA.addEventListener('ended', handoff, { once: true });
+            mkOf(A).addEventListener('playbackStateDidChange', () => {
+              const s = mkOf(A).playbackState;
+              if (s === 9 || s === 10 || s === 5) handoff();
+            });
+            await waitFor(() => { const el = elOf(B); return el && !el.paused && el.currentTime > 0.05; }, 30000);
+            await sleep(TAIL_MS);
+            const rec = stopRec();
+            RESULT.phases.push({
+              phase: 'E2-primed-handoff',
+              strategy: 'second instance primed to readyState 4, started at A.ended',
+              handoffFiredAtMs: fired,
+              gap: derive(rec, 'a', 'b'),
+              timeline: rec,
+            });
+            try { await mkOf(A).stop(); } catch (_) {}
+          } else {
+            RESULT.phases.push({ phase: 'E2-primed-handoff', skipped: 'E1 preconditions failed' });
+          }
+
+          // ── E3 — deliberate overlap ──────────────────────────────────────
+          // Roles swap: B is now the outgoing track, A primes the next one.
+          // Start A EARLY_MS before B's end, silent, then swap gain. Negative
+          // gapMs and non-zero overlapMs mean the two genuinely coexisted.
+          // Requires E2 to have actually handed off — otherwise B is parked,
+          // not playing, and there is no outgoing track to overlap with.
+          if (IDS.length > 2 && handoffRan) {
+            const primeA = await prime(A, IDS[2]);
+            startRec();
+            seekNearEnd(B);
+            const mkB = mkOf(B);
+            const durB = (mkB.nowPlayingItem?.attributes?.durationInMillis ?? 0) / 1000;
+            const elB = elOf(B);
+            let started = null, swapped = null;
+            const startEarly = () => {
+              if (started !== null) return;
+              started = +(performance.now() - t0).toFixed(1);
+              setVol(A, 0);
+              try { mkOf(A).play(); } catch (e) { fail('overlap-start', e); }
+            };
+            const swap = () => {
+              if (swapped !== null) return;
+              swapped = +(performance.now() - t0).toFixed(1);
+              setVol(A, 1); setVol(B, 0);
+            };
+            // Poll for the approaching end rather than trusting a single timer:
+            // seeking makes any precomputed deadline unreliable.
+            const watch = setInterval(() => {
+              const el = elOf(B);
+              if (!el || !durB) return;
+              const remainMs = (durB - el.currentTime) * 1000;
+              if (remainMs <= EARLY_MS) startEarly();
+              if (remainMs <= 0) swap();
+            }, 10);
+            if (elB) elB.addEventListener('ended', swap, { once: true });
+            await waitFor(() => { const el = elOf(A); return el && !el.paused && el.currentTime > 0.05; }, 30000);
+            await sleep(TAIL_MS);
+            clearInterval(watch);
+            const rec = stopRec();
+            RESULT.phases.push({
+              phase: 'E3-overlap-swap',
+              strategy: `start incoming ${EARLY_MS}ms early at volume 0, then swap gain`,
+              primeA,
+              startedEarlyAtMs: started, swappedAtMs: swapped,
+              gap: derive(rec, 'b', 'a'),
+              // Honest cost of the trick: this much of the incoming track plays
+              // underneath the outgoing one rather than cleanly after it.
+              layeredMs: (started !== null && swapped !== null) ? +(swapped - started).toFixed(1) : null,
+              timeline: rec,
+            });
+          } else {
+            RESULT.phases.push({
+              phase: 'E3-overlap-swap',
+              skipped: handoffRan ? 'needs a 3rd track id' : 'E2 never handed off — nothing was playing to overlap with',
+            });
+          }
+        } catch (e) { fail('phaseE', e); try { stopRec(); } catch (_) {} }
+
+        for (const f of [A, B]) { try { mkOf(f).stop(); } catch (_) {} }
+        flush();
+      })();
+    </script>
+  </body>
+</html>

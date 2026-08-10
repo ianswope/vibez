@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<!--
+  PROTOTYPE INSTRUMENT — issue #96, phase E. Not shipped.
+
+  One MusicKit instance in its own browsing context. Two of these are loaded as
+  same-origin iframes so the coordinator can drive them independently and reach
+  each one's media element directly. MusicKit.getInstance() is a singleton per
+  context, so separate frames is what makes two instances possible at all.
+
+  Deliberately dumb: it configures and exposes the instance, nothing else. All
+  sequencing lives in the coordinator so the timing logic is in one file.
+-->
+<html>
+  <head><meta charset="utf-8"><title>vibez dual probe frame</title></head>
+  <body>
+    <script>
+      window.__ready = false;
+      window.__error = null;
+      // Listener must be registered before the musickit.js tag — the event is
+      // dispatched synchronously on load.
+      document.addEventListener('musickitloaded', async function () {
+        try {
+          await MusicKit.configure({
+            developerToken: '{{.DeveloperToken}}',
+            app: { name: 'vibez-probe-dual', build: 'probe' },
+          });
+          const inst = MusicKit.getInstance();
+          if ('{{.UserToken}}') inst.musicUserToken = '{{.UserToken}}';
+          window.__mk = inst;
+          window.__ready = true;
+        } catch (e) {
+          window.__error = String((e && (e.name + ': ' + e.message)) || e);
+        }
+      });
+    </script>
+    <script src="https://js-cdn.music.apple.com/musickit/v3/musickit.js" data-web-components async></script>
+  </body>
+</html>
