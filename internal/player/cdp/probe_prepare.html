@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<!--
+  PROTOTYPE INSTRUMENT — issue #96 phase F (warm without play). Not shipped.
+
+  Phase E proved the double-buffer design works at the media layer — a second
+  MusicKit instance reached readyState 4 with the next track fully buffered and
+  licensed — and that it is blocked by one rule: starting playback anywhere
+  pauses playback everywhere else. Priming needed play(), so priming killed the
+  live stream.
+
+  That reframes the question. The hand-off itself is already free: at a real
+  boundary, "starting B pauses A" is exactly the wanted behaviour. Everything
+  turns on whether an idle instance can be warmed WITHOUT play().
+
+  Four instance methods surfaced by the phase-A enumeration are named like they
+  might do precisely that, and none is documented:
+
+      loadItems, deferPlayback, playbackControllerForItems, setPlaybackController
+
+  So: introspect them first (arity and source, since the names alone are
+  guesses), then call each on an idle instance while another one plays, and
+  record two things per attempt — did it warm anything, and did the live
+  stream survive. A method that warms without pausing wins outright.
+
+  Also tests the dumbest option, which would be the best if it worked: does
+  setQueue() alone warm the element, with no further call at all?
+-->
+<html>
+  <head><meta charset="utf-8"><title>vibez prepare probe</title></head>
+  <body>
+    <script>
+      window.addEventListener('error', (e) => window.__fail?.(e.message || 'window error'));
+      window.addEventListener('unhandledrejection', (e) => window.__fail?.(String(e.reason)));
+    </script>
+    <script>
+      (async function () {
+        const RESULT = { introspection: {}, attempts: [], errors: [], config: {} };
+        const fail = (stage, e) => RESULT.errors.push({
+          stage, error: (e && (e.name ? e.name + ': ' + (e.message || '') : e.message)) || String(e),
+        });
+        let flushed = false;
+        const flush = () => { if (flushed) return; flushed = true; goProbeResult(JSON.stringify(RESULT)).catch(() => {}); };
+        window.__fail = (m) => { fail('window', m); flush(); };
+
+        const IDS     = {{.IDsJSON}};
+        const SETTLE  = {{.SettleMs}};
+        RESULT.config = { ids: IDS, settleMs: SETTLE };
+
+        const STATE = ['none','loading','playing','paused','stopped','ended','seekFwd','seekBwd','waiting','completed','completed'];
+        const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+        const waitFor = (pred, ms) => new Promise(res => {
+          const iv = setInterval(() => { let v = false; try { v = pred(); } catch (_) {} if (v) { clearInterval(iv); clearTimeout(to); res(true); } }, 20);
+          const to = setTimeout(() => { clearInterval(iv); res(false); }, ms);
+        });
+
+        const mkFrame = (name) => new Promise((res, rej) => {
+          const f = document.createElement('iframe');
+          f.style.cssText = 'width:1px;height:1px;border:0;position:absolute;left:-9999px';
+          f.src = '/frame?n=' + name;
+          f.onload = async () => {
+            const ok = await waitFor(() => f.contentWindow.__ready || f.contentWindow.__error, 30000);
+            if (!ok) return rej(new Error(name + ': frame never became ready'));
+            if (f.contentWindow.__error) return rej(new Error(name + ': ' + f.contentWindow.__error));
+            res(f);
+          };
+          document.body.appendChild(f);
+        });
+
+        let A, B;
+        try { [A, B] = await Promise.all([mkFrame('A'), mkFrame('B')]); }
+        catch (e) { fail('frames', e); flush(); return; }
+
+        const mkOf = (f) => f.contentWindow.MusicKit.getInstance();
+        const elOf = (f) => { try { return f.contentDocument.querySelector('audio,video'); } catch (_) { return null; } };
+        const setVol = (f, v) => { const el = elOf(f); if (el) el.volume = v; };
+        const snap = (f) => {
+          let mk = null; try { mk = mkOf(f); } catch (_) {}
+          const el = elOf(f);
+          return {
+            st: mk ? (STATE[mk.playbackState] ?? mk.playbackState) : null,
+            elExists: !!el,
+            ct: el ? +(el.currentTime || 0).toFixed(3) : null,
+            paused: el ? !!el.paused : null,
+            ready: el ? el.readyState : null,
+            buf: (el && el.buffered && el.buffered.length) ? +el.buffered.end(el.buffered.length - 1).toFixed(2) : null,
+            hasSrc: el ? !!(el.currentSrc || el.src) : null,
+          };
+        };
+
+        // ── F0 — introspect the undocumented candidates ───────────────────
+        // Names are only a hint. Arity and source decide what to pass; calling
+        // blind would mostly produce TypeErrors that teach nothing.
+        try {
+          const inst = mkOf(B);
+          const names = ['loadItems','deferPlayback','playbackControllerForItems','setPlaybackController',
+                         'getPlaybackController','getPlaybackControllerByType','signalIntent',
+                         'signalChangeItemIntent','playLater','playNext','prepareToPlay','preloadItem'];
+          for (const n of names) {
+            let fn = null; try { fn = inst[n]; } catch (_) {}
+            RESULT.introspection[n] = (typeof fn === 'function')
+              ? { arity: fn.length, source: String(fn).slice(0, 400) }
+              : { arity: null, source: null, absent: true };
+          }
+          const q = inst.queue;
+          if (q && typeof q.appendQueueItems === 'function') {
+            RESULT.introspection['queue.appendQueueItems'] = { arity: q.appendQueueItems.length, source: String(q.appendQueueItems).slice(0, 400) };
+          }
+        } catch (e) { fail('introspect', e); }
+
+        // ── live stream on A ──────────────────────────────────────────────
+        let aRecoveries = 0;
+        const ensureAPlaying = async () => {
+          const el = elOf(A);
+          if (el && !el.paused) {
+            const t = el.currentTime;
+            await sleep(250);
+            if (elOf(A) && elOf(A).currentTime > t) return true;
+          }
+          aRecoveries++;
+          try { await mkOf(A).play(); } catch (e) { fail('resumeA', e); }
+          return waitFor(() => { const e2 = elOf(A); return e2 && !e2.paused && e2.currentTime > 0; }, 20000);
+        };
+
+        try {
+          await mkOf(A).setQueue({ songs: [IDS[0]] });
+          setVol(A, 1);
+          await mkOf(A).play();
+          const started = await waitFor(() => { const el = elOf(A); return el && !el.paused && el.currentTime > 0.4; }, 30000);
+          RESULT.aStartedPlaying = started;
+          if (!started) { fail('startA', 'instance A never began playing'); flush(); return; }
+        } catch (e) { fail('startA', e); flush(); return; }
+
+        // Run one candidate against idle instance B and judge it on the only
+        // two axes that matter: did B warm, did A keep playing.
+        const tryAttempt = async (label, fn) => {
+          await ensureAPlaying();
+          const aBefore = snap(A), bBefore = snap(B);
+          let error = null, returned = null;
+          try {
+            const r = await fn();
+            returned = (r === undefined) ? 'undefined' : (typeof r === 'object' && r !== null ? 'object' : String(r)).slice(0, 80);
+          } catch (e) {
+            error = (e && (e.name ? e.name + ': ' + (e.message || '') : e.message)) || String(e);
+          }
+          await sleep(SETTLE);
+          const aAfter = snap(A), bAfter = snap(B);
+          const aSurvived = aAfter.ct !== null && aBefore.ct !== null && aAfter.ct > aBefore.ct && !aAfter.paused;
+          const bWarmed = (bAfter.ready ?? 0) > 0 || (bAfter.buf ?? 0) > 0;
+          RESULT.attempts.push({
+            label, error, returned,
+            bBefore, bAfter, aBefore, aAfter,
+            bWarmed,
+            bReadyState: bAfter.ready,
+            bBufferedSec: bAfter.buf,
+            aSurvived,
+            // The whole point: warmed the next track AND left the current one alone.
+            verdict: bWarmed && aSurvived ? 'WARMED-WITHOUT-PAUSING' : (bWarmed ? 'warmed but paused A' : (aSurvived ? 'no warming' : 'no warming, and paused A')),
+          });
+          // Leave B quiet before the next attempt.
+          try { const el = elOf(B); if (el && !el.paused) await mkOf(B).pause(); } catch (_) {}
+        };
+
+        try {
+          const id = IDS[1];
+          const mkB = () => mkOf(B);
+
+          // The best possible outcome: setQueue alone is enough.
+          await tryAttempt('setQueue only (no play)', async () => mkB().setQueue({ songs: [id] }));
+
+          // Element-level warming, if MusicKit created an element by now. No
+          // MusicKit API involved, so nothing should count it as a stream.
+          await tryAttempt('element.preload=auto + load()', async () => {
+            const el = elOf(B);
+            if (!el) throw new Error('no media element on B');
+            el.preload = 'auto';
+            el.load();
+            return 'called';
+          });
+
+          // The named candidates, several plausible shapes each.
+          await tryAttempt('loadItems({songs:[id]})', async () => mkB().loadItems({ songs: [id] }));
+          await tryAttempt('loadItems([id])', async () => mkB().loadItems([id]));
+          await tryAttempt('loadItems([{id,type:songs}])', async () => mkB().loadItems([{ id, type: 'songs' }]));
+          await tryAttempt('deferPlayback()', async () => mkB().deferPlayback());
+          await tryAttempt('deferPlayback(true)', async () => mkB().deferPlayback(true));
+          await tryAttempt('playbackControllerForItems([{id,type:songs}])', async () => mkB().playbackControllerForItems([{ id, type: 'songs' }]));
+          await tryAttempt('getPlaybackControllerByType(songs)', async () => mkB().getPlaybackControllerByType('songs'));
+
+          // Last: this one can plausibly leave the instance unusable.
+          await tryAttempt('setPlaybackController(fromItems)', async () => {
+            const c = await mkB().playbackControllerForItems([{ id, type: 'songs' }]);
+            return mkB().setPlaybackController(c);
+          });
+        } catch (e) { fail('attempts', e); }
+
+        RESULT.aRecoveries = aRecoveries;
+        for (const f of [A, B]) { try { mkOf(f).stop(); } catch (_) {} }
+        flush();
+      })();
+    </script>
+  </body>
+</html>
