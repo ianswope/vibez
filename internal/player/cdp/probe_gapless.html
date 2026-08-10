@@ -69,9 +69,65 @@
           RESULT.api.repeatMode  = typeof inst.repeatMode;
           RESULT.api.shuffleMode = typeof inst.shuffleMode;
 
+          // ── 1b. Full member enumeration ───────────────────────────────────
+          // The fixed probe list above can only confirm methods we already
+          // guessed at. The measured residual gap is decoder/licence readiness
+          // AFTER the data is buffered, so the only thing that could shrink it
+          // is an API that prepares the next item early. Walk the whole
+          // prototype chain to find out whether one exists at all.
+          //
+          // Descriptors only — never read o[k], because accessor properties on
+          // the live instance would fire getters and could perturb playback.
+          const allMembers = (o) => {
+            const fns = new Set(), props = new Set();
+            for (let p = o; p && p !== Object.prototype; p = Object.getPrototypeOf(p)) {
+              for (const k of Object.getOwnPropertyNames(p)) {
+                if (k === 'constructor') continue;
+                let d; try { d = Object.getOwnPropertyDescriptor(p, k); } catch (_) { continue; }
+                if (!d) continue;
+                if (typeof d.value === 'function') fns.add(k); else props.add(k);
+              }
+            }
+            return { fns: [...fns].sort(), props: [...props].sort() };
+          };
+          try {
+            const instM = allMembers(inst);
+            const queueM = q ? allMembers(q) : { fns: [], props: [] };
+            const nsM = allMembers(MusicKit);
+            // Anything that could plausibly prepare/prefetch the next item.
+            const RE = /pre(pare|load|fetch|buffer)|prefetch|preload|buffer|cache|warm|nextItem|upcoming/i;
+            const interesting = [];
+            for (const [scope, m] of [['instance', instM], ['queue', queueM], ['MusicKit', nsM]]) {
+              for (const k of [...m.fns, ...m.props]) if (RE.test(k)) interesting.push(scope + '.' + k);
+            }
+            RESULT.enumeration = {
+              instanceFns: instM.fns, instanceProps: instM.props,
+              queueFns: queueM.fns, queueProps: queueM.props,
+              namespaceFns: nsM.fns,
+              interesting,
+            };
+          } catch (e) { fail('enumerate', e); }
+
           // ── shared instrumentation ────────────────────────────────────────
           const STATE = ['none','loading','playing','paused','stopped','ended','seekFwd','seekBwd','waiting','completed','completed'];
           let timeline = [], t0 = 0, poll = null;
+
+          // MusicKit's currentPlaybackTime only ticks in whole seconds, which
+          // quantises any gap derived from it to roughly +/-1s — useless when the
+          // whole question is whether a boundary costs 100ms or 1300ms. The
+          // underlying media element carries float currentTime, so measure there
+          // and keep currentPlaybackTime only as a cross-check.
+          const mediaSnapshot = () => Array.from(document.querySelectorAll('audio,video')).map((el, i) => ({
+            i,
+            ct: +(el.currentTime || 0).toFixed(3),
+            paused: !!el.paused,
+            ready: el.readyState,
+            // Proves prebuffering: if the next track is being fetched while the
+            // current one still plays, buffered.end runs ahead of currentTime.
+            buffEnd: (el.buffered && el.buffered.length) ? +el.buffered.end(el.buffered.length - 1).toFixed(2) : null,
+            src: (el.currentSrc || '').slice(-28) || null,
+          }));
+
           const stamp = (kind, extra) => {
             const inst = m();
             timeline.push(Object.assign({
@@ -82,6 +138,7 @@
               itemId: inst.nowPlayingItem?.id ?? null,
               pos: +(inst.currentPlaybackTime ?? -1).toFixed(2),
               qpos: inst.queue?.position,
+              media: mediaSnapshot(),
             }, extra || {}));
           };
           const onState = () => stamp('playbackStateDidChange');
@@ -121,6 +178,36 @@
               : { gapMs: null, lastAdvanceA, firstAdvanceB, note: 'could not observe position advancing on both tracks' };
           };
 
+          // The number that actually answers the issue: wall-clock silence between
+          // the last moment a media element was decoding track A and the first
+          // moment one was decoding track B. Resolution is the 50ms poll, ~20x
+          // finer than deriveGap(). "Advancing" requires currentTime to move on an
+          // unpaused element matched by index+src, so a src swap (currentTime
+          // resetting to 0) is not mistaken for progress.
+          const deriveGapMedia = (tl, firstId) => {
+            let prev = null, lastA = null, firstB = null;
+            const advancing = (e) => {
+              if (!prev || !prev.media || !e.media) return false;
+              for (const cur of e.media) {
+                const p = prev.media.find(x => x.i === cur.i && x.src === cur.src);
+                if (p && !cur.paused && cur.ct - p.ct > 0.002) return true;
+              }
+              return false;
+            };
+            for (const e of tl) {
+              if (advancing(e)) {
+                if (e.itemId === firstId) lastA = e.t;
+                else if (e.itemId && lastA !== null && firstB === null) firstB = e.t;
+              }
+              prev = e;
+            }
+            const src = 'media-element currentTime, 50ms poll';
+            return (lastA !== null && firstB !== null)
+              ? { gapMs: +(firstB - lastA).toFixed(1), lastAdvanceA: lastA, firstAdvanceB: firstB, source: src }
+              : { gapMs: null, lastAdvanceA: lastA, firstAdvanceB: firstB, source: src,
+                  note: 'could not observe media currentTime advancing on both tracks' };
+          };
+
           const IDS = {{.IDsJSON}};
 
           // Resolve catalog IDs to items once, mirroring _resolveItems().
@@ -135,6 +222,10 @@
 
           // Jump to just before the end so a boundary happens in seconds.
           const LEAD_S = {{.LeadSeconds}};
+          // Keep recording after the new track reports playing. Without this the
+          // recording stops within ~500ms of the boundary and the second track
+          // never accumulates enough samples to show progress at all.
+          const TAIL_MS = {{.TailMs}};
           const seekNearEnd = async () => {
             const dur = (m().nowPlayingItem?.attributes?.durationInMillis ?? 0) / 1000;
             if (dur > LEAD_S + 2) m().seekToTime(Math.max(0, dur - LEAD_S));
@@ -160,10 +251,12 @@
             stamp('completed-observed');
             await m().setQueue({ songs: [resolved[1].id] });
             await m().play();
-            await waitFor(() => m().playbackState === 2 && (m().currentPlaybackTime ?? 0) > 0.3, 20000);
+            await waitFor(() => m().playbackState === 2, 20000);
+            await new Promise(r => setTimeout(r, TAIL_MS));
             const tl = stopRecording();
             RESULT.phases.push({ phase: 'A-rebuild-baseline', strategy: 'one-item setQueue per track (current shipping behaviour)',
-                                 gap: deriveGap(tl, resolved[0].id), timeline: tl });
+                                 gap: deriveGap(tl, resolved[0].id),
+                                 gapMedia: deriveGapMedia(tl, resolved[0].id), timeline: tl });
           } catch (e) { fail('phaseA', e); stopRecording(); }
 
           // ── PHASE B — native multi-item queue ─────────────────────────────
@@ -183,10 +276,12 @@
             await seekNearEnd();
             const advanced = await waitFor(
               () => m().nowPlayingItem?.id && m().nowPlayingItem.id !== resolved[0].id &&
-                    m().playbackState === 2 && (m().currentPlaybackTime ?? 0) > 0.3, 25000);
+                    m().playbackState === 2, 25000);
+            await new Promise(r => setTimeout(r, TAIL_MS));
             const tl = stopRecording();
             RESULT.phases.push({ phase: 'B-native-queue', strategy: 'single multi-item setQueue, MusicKit auto-advances',
-                                 autoAdvanced: advanced, gap: deriveGap(tl, resolved[0].id), timeline: tl });
+                                 autoAdvanced: advanced, gap: deriveGap(tl, resolved[0].id),
+                                 gapMedia: deriveGapMedia(tl, resolved[0].id), timeline: tl });
           } catch (e) { fail('phaseB', e); stopRecording(); }
 
           // ── PHASE C — is mid-session setQueue really refused? ─────────────

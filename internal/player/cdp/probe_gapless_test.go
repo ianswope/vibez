@@ -13,6 +13,11 @@
 //
 // Pick consecutive tracks from an album you know is mastered gapless; that is
 // the case issue #96 is actually about.
+//
+// Optional knobs: VIBEZ_PROBE_LEAD (seconds before track end to seek to, default
+// 6), VIBEZ_PROBE_TAIL (ms to keep recording past the boundary, default 3000 —
+// below ~1s the incoming track yields no measurable progress), VIBEZ_PROBE_OUT
+// (result path), VIBEZ_PROBE_CONFIG (alternate config file).
 package cdp
 
 import (
@@ -69,6 +74,15 @@ func TestProbeGapless(t *testing.T) {
 		}
 	}
 
+	// Recording has to outlast the boundary by enough for the incoming track to
+	// accumulate samples; 500ms of tail measures nothing.
+	tailMs := 3000
+	if v := os.Getenv("VIBEZ_PROBE_TAIL"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			tailMs = n
+		}
+	}
+
 	idsJSON, err := json.Marshal(ids)
 	if err != nil {
 		t.Fatalf("marshal ids: %v", err)
@@ -84,6 +98,7 @@ func TestProbeGapless(t *testing.T) {
 		"Storefront":     cfg.StoreFront,
 		"IDsJSON":        string(idsJSON),
 		"LeadSeconds":    leadSeconds,
+		"TailMs":         tailMs,
 	}); err != nil {
 		t.Fatalf("render probe: %v", err)
 	}
@@ -181,6 +196,25 @@ func TestProbeGapless(t *testing.T) {
 	}
 }
 
+// probeGap is one derivation of the boundary gap. Two are reported per phase:
+// a fine one from the media element and a coarse one from MusicKit's
+// whole-second position counter.
+type probeGap struct {
+	GapMs *float64 `json:"gapMs"`
+	Note  string   `json:"note"`
+}
+
+func gapStr(g *probeGap) string {
+	switch {
+	case g == nil:
+		return "n/a"
+	case g.GapMs != nil:
+		return fmt.Sprintf("%.1f ms", *g.GapMs)
+	default:
+		return "UNMEASURED (" + g.Note + ")"
+	}
+}
+
 // summarize prints the handful of facts the design decision actually turns on,
 // so the answer is readable without opening the JSON.
 func summarize(t *testing.T, out []byte) {
@@ -191,18 +225,22 @@ func summarize(t *testing.T, out []byte) {
 		MultiItemQueueBuilt bool           `json:"multiItemQueueBuilt"`
 		NativeQueueLength   *int           `json:"nativeQueueLength"`
 		Phases              []struct {
-			Phase        string `json:"phase"`
-			Case         string `json:"case"`
-			Op           string `json:"op"`
-			OK           *bool  `json:"ok"`
-			AutoAdvanced *bool  `json:"autoAdvanced"`
-			Error        any    `json:"error"`
-			QueueChanged *bool  `json:"queueChanged"`
-			Gap          *struct {
-				GapMs *float64 `json:"gapMs"`
-				Note  string   `json:"note"`
-			} `json:"gap"`
+			Phase        string    `json:"phase"`
+			Case         string    `json:"case"`
+			Op           string    `json:"op"`
+			OK           *bool     `json:"ok"`
+			AutoAdvanced *bool     `json:"autoAdvanced"`
+			Error        any       `json:"error"`
+			QueueChanged *bool     `json:"queueChanged"`
+			Gap          *probeGap `json:"gap"`
+			GapMedia     *probeGap `json:"gapMedia"`
 		} `json:"phases"`
+		Enumeration struct {
+			InstanceFns  []string `json:"instanceFns"`
+			QueueFns     []string `json:"queueFns"`
+			NamespaceFns []string `json:"namespaceFns"`
+			Interesting  []string `json:"interesting"`
+		} `json:"enumeration"`
 		Errors []map[string]string `json:"errors"`
 	}
 	if err := json.Unmarshal(out, &r); err != nil {
@@ -229,12 +267,23 @@ func summarize(t *testing.T, out []byte) {
 	t.Logf("API present: %s", strings.Join(present, ", "))
 	t.Logf("API ABSENT : %s", strings.Join(absent, ", "))
 
+	e := r.Enumeration
+	t.Logf("enumerated members: instance %d fns, queue %d fns, MusicKit %d fns",
+		len(e.InstanceFns), len(e.QueueFns), len(e.NamespaceFns))
+	if len(e.Interesting) == 0 {
+		t.Log("prepare/preload/prefetch candidates: NONE — no API to warm the next item")
+	} else {
+		t.Logf("prepare/preload/prefetch candidates: %s", strings.Join(e.Interesting, ", "))
+	}
+	t.Logf("instance fns: %s", strings.Join(e.InstanceFns, " "))
+	t.Logf("queue fns   : %s", strings.Join(e.QueueFns, " "))
+
 	for _, p := range r.Phases {
 		switch {
-		case p.Gap != nil && p.Gap.GapMs != nil:
-			t.Logf("%-22s gap = %.1f ms", p.Phase, *p.Gap.GapMs)
-		case p.Gap != nil:
-			t.Logf("%-22s gap = UNMEASURED (%s)", p.Phase, p.Gap.Note)
+		case p.GapMedia != nil || p.Gap != nil:
+			// The media-element figure is the answer; the coarse
+			// currentPlaybackTime one is printed beside it as a sanity check.
+			t.Logf("%-22s GAP = %s   (cross-check, +/-1s: %s)", p.Phase, gapStr(p.GapMedia), gapStr(p.Gap))
 		case p.Case != "":
 			ch := "unchanged"
 			if p.QueueChanged != nil && *p.QueueChanged {
