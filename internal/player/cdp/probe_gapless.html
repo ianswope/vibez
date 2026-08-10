@@ -294,14 +294,31 @@
             await m().setQueue({ songs: resolved.map(s => s.id) });
             await m().play();
             await waitFor(() => m().playbackState === 2, 15000);
+            // Each attempt is judged on its own, so re-establish playback first:
+            // otherwise attempt N inherits whatever attempt N-1 did to the
+            // player and "was playback interrupted" stops meaning anything.
             const attempt = async (label, descriptor) => {
-              const before = { len: m().queue?.length, ids: (m().queue?.items ?? []).map(i => i.id), nowPlaying: m().nowPlayingItem?.id };
+              await m().setQueue({ songs: resolved.map(s => s.id) });
+              await m().play();
+              await waitFor(() => m().playbackState === 2, 15000);
+              const before = { len: m().queue?.length, ids: (m().queue?.items ?? []).map(i => i.id),
+                               nowPlaying: m().nowPlayingItem?.id, position: m().queue?.position,
+                               state: m().playbackState };
               let err = null;
               try { await m().setQueue(descriptor); } catch (e) { err = (e?.name || '') + (e?.message ? ': ' + e.message : ''); }
-              const after = { len: m().queue?.length, ids: (m().queue?.items ?? []).map(i => i.id), nowPlaying: m().nowPlayingItem?.id };
+              const after = { len: m().queue?.length, ids: (m().queue?.items ?? []).map(i => i.id),
+                              nowPlaying: m().nowPlayingItem?.id, position: m().queue?.position,
+                              state: m().playbackState };
+              // Compare state and position, not just nowPlayingItem. Comparing
+              // nowPlayingItem alone reports "not interrupted" when playback had
+              // ALREADY stopped, because both sides are then undefined — a false
+              // negative that made phase H's stop look like a clean swap.
               RESULT.phases.push({ phase: 'C-midsession-setQueue', case: label, error: err, before, after,
                                    queueChanged: JSON.stringify(before.ids) !== JSON.stringify(after.ids),
-                                   playbackInterrupted: before.nowPlaying !== after.nowPlaying });
+                                   playbackInterrupted: before.nowPlaying !== after.nowPlaying
+                                                        || after.nowPlaying === undefined
+                                                        || after.position === -1
+                                                        || after.state !== before.state });
             };
             await attempt('identical content',  { songs: resolved.map(s => s.id) });
             await attempt('reordered content',  { songs: resolved.map(s => s.id).slice().reverse() });
@@ -328,6 +345,60 @@
               } catch (e) { RESULT.phases.push({ phase: 'D-mutation', op: 'queue.remove', ok: false, error: String(e?.name || e) }); }
             }
           } catch (e) { fail('phaseD', e); }
+
+          // ── PHASE H — can vibez push a reorder into a LIVE queue? ─────────
+          // Phase C showed a mid-session setQueue with changed content replaces
+          // the queue without swapping nowPlayingItem. What it did not record is
+          // where MusicKit leaves queue.position afterwards — which is exactly
+          // what decides whether _pushNativeOrder() in musickit.html can trust
+          // the swap or must fall back to a view-only reorder.
+          //
+          // Also checks real audio continuity (does currentPlaybackTime keep
+          // advancing?) rather than inferring it from nowPlayingItem alone.
+          try {
+            await settle();
+            await m().setQueue({ songs: resolved.map(s => s.id) });
+            await m().play();
+            await waitFor(() => m().playbackState === 2, 15000);
+            // Step off item 0 first: vibez reorders mid-queue, so the played
+            // prefix is normally non-empty and that is the harder case.
+            await m().skipToNextItem();
+            await waitFor(() => m().playbackState === 2, 15000);
+
+            const playingId = m().nowPlayingItem?.id;
+            const before = {
+              ids: (m().queue?.items ?? []).map(i => i.id),
+              position: m().queue?.position,
+              nowPlaying: playingId,
+              currentTime: m().currentPlaybackTime,
+            };
+            // Reverse the order, as a shuffle-off or a queue move would.
+            let err = null;
+            try {
+              await m().setQueue({ songs: resolved.map(s => s.id).slice().reverse() });
+            } catch (e) { err = (e?.name || '') + (e?.message ? ': ' + e.message : ''); }
+
+            const posAfter = m().queue?.position;
+            const idsAfter = (m().queue?.items ?? []).map(i => i.id);
+            const after = {
+              ids: idsAfter, position: posAfter, itemAtPosition: idsAfter[posAfter],
+              nowPlaying: m().nowPlayingItem?.id,
+              currentTime: m().currentPlaybackTime,
+              state: m().playbackState,
+            };
+            const t0 = m().currentPlaybackTime;
+            await new Promise(r => setTimeout(r, 1200));
+            const t1 = m().currentPlaybackTime;
+
+            RESULT.phases.push({
+              phase: 'H-push-reorder', error: err, before, after,
+              queueChanged: JSON.stringify(before.ids) !== JSON.stringify(after.ids),
+              // The precise predicate _pushNativeOrder uses to accept a push.
+              positionFollowedPlayingItem: after.itemAtPosition === playingId,
+              playbackKeptAdvancing: (t1 - t0) > 0.2,
+              advancedBySec: Number((t1 - t0).toFixed(3)),
+            });
+          } catch (e) { fail('phaseH', e); }
 
           try { await m().stop(); } catch (_) {}
           flush();
