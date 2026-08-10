@@ -1,0 +1,244 @@
+<!DOCTYPE html>
+<!--
+  PROTOTYPE INSTRUMENT — issue #96 (seamless transitions). Not shipped.
+
+  Answers the questions that reading musickit.html cannot:
+
+    1. Which queue-mutation APIs does this MusicKit build actually expose?
+    2. Does setQueue() with several items really build a multi-item native queue?
+    3. At a track boundary, does MusicKit advance on its own — and which events
+       fire, in what order, with which playbackState values?
+    4. How long is the audible gap, measured, for BOTH strategies:
+         · "rebuild"  — today's one-item setQueue per track (the baseline)
+         · "native"   — one multi-item setQueue, MusicKit advances itself
+    5. Does setQueue() mid-session actually fail with CONTENT_EQUIVALENT, and
+       under exactly which conditions?
+
+  Everything is reported as JSON via goProbeResult(). Nothing here is a
+  behavioural claim — it records what happened and lets the caller judge.
+-->
+<html>
+  <head><meta charset="utf-8"><title>vibez gapless probe</title></head>
+  <body>
+    <script>
+      // Report an unhandled failure rather than hanging the harness forever.
+      window.addEventListener('error',   (e) => window.__fail?.(e.message || 'window error'));
+      window.addEventListener('unhandledrejection', (e) => window.__fail?.(String(e.reason)));
+    </script>
+    <script>
+      document.addEventListener('musickitloaded', async function () {
+        const RESULT = { musickitVersion: null, api: {}, phases: [], errors: [] };
+        const fail = (stage, e) => {
+          RESULT.errors.push({ stage, error: (e && (e.name ? e.name + ': ' + (e.message || '') : e.message)) || String(e) });
+        };
+        window.__fail = (m) => { fail('window', m); flush(); };
+        let flushed = false;
+        const flush = () => {
+          if (flushed) return;
+          flushed = true;
+          goProbeResult(JSON.stringify(RESULT)).catch(() => {});
+        };
+
+        try {
+          const music = await MusicKit.configure({
+            developerToken: '{{.DeveloperToken}}',
+            app: { name: 'vibez-probe', build: 'probe' },
+          });
+          const m = () => MusicKit.getInstance();
+          if ('{{.UserToken}}') m().musicUserToken = '{{.UserToken}}';
+          RESULT.musickitVersion = MusicKit.version || null;
+          RESULT.storefront = m().storefrontId || null;
+
+          // ── 1. API surface ────────────────────────────────────────────────
+          // Feature-detection only; no calls. Tells us whether the "full native
+          // queue" design is even expressible in this build.
+          const inst = m();
+          const probeFns = ['play','pause','stop','setQueue','skipToNextItem','skipToPreviousItem',
+                            'changeToMediaAtIndex','changeToMediaItem','seekToTime'];
+          for (const f of probeFns) RESULT.api[f] = typeof inst[f] === 'function';
+          const q = inst.queue;
+          RESULT.api._queueExists = !!q;
+          if (q) {
+            for (const f of ['append','prepend','remove','insertItemsAtIndex','splice']) {
+              RESULT.api['queue.' + f] = typeof q[f] === 'function';
+            }
+            RESULT.api['queue.items']    = Array.isArray(q.items);
+            RESULT.api['queue.position'] = typeof q.position;
+            RESULT.api['queue.length']   = typeof q.length;
+          }
+          RESULT.api.repeatMode  = typeof inst.repeatMode;
+          RESULT.api.shuffleMode = typeof inst.shuffleMode;
+
+          // ── shared instrumentation ────────────────────────────────────────
+          const STATE = ['none','loading','playing','paused','stopped','ended','seekFwd','seekBwd','waiting','completed','completed'];
+          let timeline = [], t0 = 0, poll = null;
+          const stamp = (kind, extra) => {
+            const inst = m();
+            timeline.push(Object.assign({
+              t: +(performance.now() - t0).toFixed(1),
+              kind,
+              state: STATE[inst.playbackState] ?? inst.playbackState,
+              stateNum: inst.playbackState,
+              itemId: inst.nowPlayingItem?.id ?? null,
+              pos: +(inst.currentPlaybackTime ?? -1).toFixed(2),
+              qpos: inst.queue?.position,
+            }, extra || {}));
+          };
+          const onState = () => stamp('playbackStateDidChange');
+          const onItem  = () => stamp('nowPlayingItemDidChange');
+          const startRecording = () => {
+            timeline = []; t0 = performance.now();
+            m().addEventListener('playbackStateDidChange', onState);
+            m().addEventListener('nowPlayingItemDidChange', onItem);
+            // 50 ms poll: event timestamps alone can't show whether audio is
+            // actually progressing across the boundary.
+            poll = setInterval(() => stamp('poll'), 50);
+          };
+          const stopRecording = () => {
+            clearInterval(poll);
+            m().removeEventListener('playbackStateDidChange', onState);
+            m().removeEventListener('nowPlayingItemDidChange', onItem);
+            return timeline.slice();
+          };
+
+          // Derive the audible gap: last moment track A's position was advancing
+          // → first moment track B's position was advancing. Deliberately
+          // computed from position movement, not from state labels, because the
+          // whole question is whether the state machine lies about continuity.
+          const deriveGap = (tl, firstId) => {
+            let lastAdvanceA = null, firstAdvanceB = null, prev = null;
+            for (const e of tl) {
+              if (e.pos < 0) continue;
+              if (e.itemId === firstId) {
+                if (prev && prev.itemId === firstId && e.pos > prev.pos) lastAdvanceA = e.t;
+              } else if (e.itemId && e.itemId !== firstId) {
+                if (firstAdvanceB === null && prev && prev.itemId === e.itemId && e.pos > prev.pos) firstAdvanceB = e.t;
+              }
+              prev = e;
+            }
+            return (lastAdvanceA !== null && firstAdvanceB !== null)
+              ? { gapMs: +(firstAdvanceB - lastAdvanceA).toFixed(1), lastAdvanceA, firstAdvanceB }
+              : { gapMs: null, lastAdvanceA, firstAdvanceB, note: 'could not observe position advancing on both tracks' };
+          };
+
+          const IDS = {{.IDsJSON}};
+
+          // Resolve catalog IDs to items once, mirroring _resolveItems().
+          const sf = m().storefrontId || '{{.Storefront}}' || 'us';
+          let resolved = [];
+          try {
+            const r = await m().api.music(`/v1/catalog/${sf}/songs`, { ids: IDS, include: 'library' });
+            resolved = r?.data?.data ?? [];
+            RESULT.resolved = resolved.map(s => ({ id: s.id, name: s.attributes?.name, durationMs: s.attributes?.durationInMillis }));
+          } catch (e) { fail('resolve', e); flush(); return; }
+          if (resolved.length < 2) { fail('resolve', 'need >=2 playable songs, got ' + resolved.length); flush(); return; }
+
+          // Jump to just before the end so a boundary happens in seconds.
+          const LEAD_S = {{.LeadSeconds}};
+          const seekNearEnd = async () => {
+            const dur = (m().nowPlayingItem?.attributes?.durationInMillis ?? 0) / 1000;
+            if (dur > LEAD_S + 2) m().seekToTime(Math.max(0, dur - LEAD_S));
+          };
+          const waitFor = (pred, ms) => new Promise(res => {
+            const iv = setInterval(() => { if (pred()) { clearInterval(iv); clearTimeout(to); res(true); } }, 40);
+            const to = setTimeout(() => { clearInterval(iv); res(false); }, ms);
+          });
+          const settle = async () => { try { await m().stop(); } catch (_) {} await new Promise(r => setTimeout(r, 600)); };
+
+          // ── PHASE A — baseline: today's one-item rebuild ──────────────────
+          // Reproduces _doPlayAt(): play song 0 alone, wait for completed, then
+          // build a fresh one-item queue for song 1. This is the gap users hear.
+          try {
+            await settle();
+            await m().setQueue({ songs: [resolved[0].id] });
+            await m().play();
+            await waitFor(() => m().playbackState === 2, 15000);
+            startRecording();
+            await seekNearEnd();
+            // Wait for completion, then rebuild exactly as the shipping code does.
+            await waitFor(() => m().playbackState === 9 || m().playbackState === 10 || m().playbackState === 5, 20000);
+            stamp('completed-observed');
+            await m().setQueue({ songs: [resolved[1].id] });
+            await m().play();
+            await waitFor(() => m().playbackState === 2 && (m().currentPlaybackTime ?? 0) > 0.3, 20000);
+            const tl = stopRecording();
+            RESULT.phases.push({ phase: 'A-rebuild-baseline', strategy: 'one-item setQueue per track (current shipping behaviour)',
+                                 gap: deriveGap(tl, resolved[0].id), timeline: tl });
+          } catch (e) { fail('phaseA', e); stopRecording(); }
+
+          // ── PHASE B — native multi-item queue ─────────────────────────────
+          // One setQueue with every song, then let MusicKit advance by itself.
+          // Nothing calls play() at the boundary — if audio continues, MusicKit
+          // prebuffered, which is the entire premise of the fix.
+          try {
+            await settle();
+            const ids = resolved.map(s => s.id);
+            await m().setQueue({ songs: ids });
+            RESULT.nativeQueueLength   = m().queue?.length ?? null;
+            RESULT.nativeQueueItemIds  = (m().queue?.items ?? []).map(i => i.id);
+            RESULT.multiItemQueueBuilt = (m().queue?.length ?? 0) > 1;
+            await m().play();
+            await waitFor(() => m().playbackState === 2, 15000);
+            startRecording();
+            await seekNearEnd();
+            const advanced = await waitFor(
+              () => m().nowPlayingItem?.id && m().nowPlayingItem.id !== resolved[0].id &&
+                    m().playbackState === 2 && (m().currentPlaybackTime ?? 0) > 0.3, 25000);
+            const tl = stopRecording();
+            RESULT.phases.push({ phase: 'B-native-queue', strategy: 'single multi-item setQueue, MusicKit auto-advances',
+                                 autoAdvanced: advanced, gap: deriveGap(tl, resolved[0].id), timeline: tl });
+          } catch (e) { fail('phaseB', e); stopRecording(); }
+
+          // ── PHASE C — is mid-session setQueue really refused? ─────────────
+          // The comment at musickit.html:216-227 claims setQueue mid-session is
+          // silently ignored with CONTENT_EQUIVALENT. But the shipping code
+          // calls it on every track change and works. Distinguish the cases:
+          // identical content, overlapping content, and wholly different.
+          try {
+            await settle();
+            await m().setQueue({ songs: resolved.map(s => s.id) });
+            await m().play();
+            await waitFor(() => m().playbackState === 2, 15000);
+            const attempt = async (label, descriptor) => {
+              const before = { len: m().queue?.length, ids: (m().queue?.items ?? []).map(i => i.id), nowPlaying: m().nowPlayingItem?.id };
+              let err = null;
+              try { await m().setQueue(descriptor); } catch (e) { err = (e?.name || '') + (e?.message ? ': ' + e.message : ''); }
+              const after = { len: m().queue?.length, ids: (m().queue?.items ?? []).map(i => i.id), nowPlaying: m().nowPlayingItem?.id };
+              RESULT.phases.push({ phase: 'C-midsession-setQueue', case: label, error: err, before, after,
+                                   queueChanged: JSON.stringify(before.ids) !== JSON.stringify(after.ids),
+                                   playbackInterrupted: before.nowPlaying !== after.nowPlaying });
+            };
+            await attempt('identical content',  { songs: resolved.map(s => s.id) });
+            await attempt('reordered content',  { songs: resolved.map(s => s.id).slice().reverse() });
+            await attempt('single new item',    { songs: [resolved[resolved.length - 1].id] });
+          } catch (e) { fail('phaseC', e); }
+
+          // ── PHASE D — do the mutation APIs work on a live queue? ──────────
+          // Decides whether remove/move can be expressed natively, which is the
+          // difference between the full-native design and a sliding window.
+          try {
+            const inst = m();
+            if (inst.queue && typeof inst.queue.append === 'function') {
+              const before = inst.queue.length;
+              try {
+                await inst.queue.append({ songs: [resolved[0].id] });
+                RESULT.phases.push({ phase: 'D-mutation', op: 'queue.append', ok: true, lengthBefore: before, lengthAfter: inst.queue.length });
+              } catch (e) { RESULT.phases.push({ phase: 'D-mutation', op: 'queue.append', ok: false, error: String(e?.name || e) }); }
+            }
+            if (inst.queue && typeof inst.queue.remove === 'function') {
+              const before = inst.queue.length;
+              try {
+                await inst.queue.remove(inst.queue.length - 1);
+                RESULT.phases.push({ phase: 'D-mutation', op: 'queue.remove', ok: true, lengthBefore: before, lengthAfter: inst.queue.length });
+              } catch (e) { RESULT.phases.push({ phase: 'D-mutation', op: 'queue.remove', ok: false, error: String(e?.name || e) }); }
+            }
+          } catch (e) { fail('phaseD', e); }
+
+          try { await m().stop(); } catch (_) {}
+          flush();
+        } catch (e) { fail('bootstrap', e); flush(); }
+      });
+    </script>
+    <script src="https://js-cdn.music.apple.com/musickit/v3/musickit.js" data-web-components async></script>
+  </body>
+</html>
