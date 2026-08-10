@@ -322,6 +322,92 @@ func TestSearch_NoWarningsWhenAllLegsSucceed(t *testing.T) {
 	}
 }
 
+// The amp-api leg can reject tokens that work everywhere else. When it does,
+// the supported /catalog/{sf}/search endpoint is retried — and because that
+// endpoint never returns extendedAssetUrls, the stream filter must be skipped
+// for its results. Applying it would drop every fallback result for lacking a
+// field the endpoint does not send, which is the empty-songs bug this fixes.
+func TestSearch_CatalogSongsFallBackWhenAmpAPIRejects(t *testing.T) {
+	// Exactly the shape the fallback returns: playable, but no extendedAssetUrls.
+	fallbackSong := songJSONNoStream("777", "Fallback Song", "Artist", "Album", 210000)
+	empty := map[string]any{"results": map[string]any{}}
+
+	var ampCalls, fallbackCalls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "/me/library/search"):
+			writeJSON(t, w, empty)
+		case r.URL.Query().Get("types") != "songs":
+			writeJSON(t, w, empty) // albums/playlists leg
+		case strings.Contains(r.URL.RawQuery, "extend=extendedAssetUrls"):
+			ampCalls.Add(1)
+			w.WriteHeader(http.StatusUnauthorized) // amp-api rejects the token
+		default:
+			fallbackCalls.Add(1)
+			writeJSON(t, w, map[string]any{"results": map[string]any{
+				"songs": map[string]any{"data": []any{fallbackSong}},
+			}})
+		}
+	}))
+	defer srv.Close()
+
+	p := newTestProvider(t, srv)
+	result, err := p.Search(context.Background(), "fallback song")
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	if got := ampCalls.Load(); got != 1 {
+		t.Errorf("amp-api calls: got %d, want 1", got)
+	}
+	if got := fallbackCalls.Load(); got != 1 {
+		t.Errorf("fallback calls: got %d, want 1 — the retry did not happen", got)
+	}
+	if len(result.Tracks) != 1 || result.Tracks[0].ID != "777" {
+		t.Fatalf("Tracks: got %+v, want the fallback track 777 kept despite having no extendedAssetUrls", result.Tracks)
+	}
+	if len(result.Warnings) != 0 {
+		t.Errorf("Warnings: got %v, want none — the fallback succeeded", result.Warnings)
+	}
+}
+
+// The filter must still apply on the amp-api path, where the field IS returned:
+// the fallback loosens it only for the endpoint that cannot report it.
+func TestSearch_StreamFilterStillAppliesWhenAmpAPISucceeds(t *testing.T) {
+	playable := songJSON("111", "Playable", "Artist", "Album", 200000, "")
+	purchaseOnly := songJSONNoStream("333", "Buy Only", "Artist", "Album", 200000)
+	empty := map[string]any{"results": map[string]any{}}
+
+	var fallbackCalls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "/me/library/search"):
+			writeJSON(t, w, empty)
+		case r.URL.Query().Get("types") != "songs":
+			writeJSON(t, w, empty)
+		case strings.Contains(r.URL.RawQuery, "extend=extendedAssetUrls"):
+			writeJSON(t, w, map[string]any{"results": map[string]any{
+				"songs": map[string]any{"data": []any{playable, purchaseOnly}},
+			}})
+		default:
+			fallbackCalls.Add(1)
+			writeJSON(t, w, empty)
+		}
+	}))
+	defer srv.Close()
+
+	p := newTestProvider(t, srv)
+	result, err := p.Search(context.Background(), "song")
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	if got := fallbackCalls.Load(); got != 0 {
+		t.Errorf("fallback calls: got %d, want 0 — amp-api succeeded", got)
+	}
+	if len(result.Tracks) != 1 || result.Tracks[0].ID != "111" {
+		t.Fatalf("Tracks: got %+v, want only the streamable track 111", result.Tracks)
+	}
+}
+
 func TestSearch_QueryEncoded(t *testing.T) {
 	var gotURLs []string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
