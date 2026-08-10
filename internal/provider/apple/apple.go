@@ -367,8 +367,9 @@ func (a *AppleProvider) Search(ctx context.Context, query string) (*provider.Sea
 		err       error
 	}
 	type catSongsOut struct {
-		songs []songResource
-		err   error
+		songs           []songResource
+		verifiedStreams bool
+		err             error
 	}
 	type catCollOut struct {
 		albums    []albumResource
@@ -419,8 +420,25 @@ func (a *AppleProvider) Search(ctx context.Context, query string) (*provider.Sea
 			return
 		}
 		var resp searchResponse
-		if err := a.do(req, &resp); err != nil {
-			catSongsCh <- catSongsOut{err: err}
+		if err := a.do(req, &resp); err == nil {
+			catSongsCh <- catSongsOut{songs: resp.Results.Songs.Data, verifiedStreams: true}
+			return
+		}
+
+		// amp-api is an undocumented web-player endpoint and can reject otherwise
+		// valid developer/user tokens. Fall back to Apple's supported catalog
+		// search. It omits extendedAssetUrls, so playback remains the final
+		// authority for storefront availability.
+		fallbackEP := fmt.Sprintf("/catalog/%s/search?term=%s&types=songs&limit=25",
+			sf, url.QueryEscape(query))
+		fallbackReq, fallbackErr := a.newRequest(ctx, http.MethodGet, fallbackEP)
+		if fallbackErr != nil {
+			catSongsCh <- catSongsOut{err: fallbackErr}
+			return
+		}
+		resp = searchResponse{}
+		if fallbackErr = a.do(fallbackReq, &resp); fallbackErr != nil {
+			catSongsCh <- catSongsOut{err: fallbackErr}
 			return
 		}
 		catSongsCh <- catSongsOut{songs: resp.Results.Songs.Data}
@@ -505,7 +523,7 @@ func (a *AppleProvider) Search(ctx context.Context, query string) (*provider.Sea
 			if s.Attributes.PlayParams.Kind != "song" {
 				continue
 			}
-			if !s.Attributes.ExtendedAssetURLs.hasStream() {
+			if catSongs.verifiedStreams && !s.Attributes.ExtendedAssetURLs.hasStream() {
 				continue
 			}
 			t := toTrack(s)
