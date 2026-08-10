@@ -315,6 +315,7 @@ func (m *SearchModel) View() string {
 	var sb strings.Builder
 	linesLeft := m.height
 	start := max(0, m.scroll)
+	compact := m.height < 3
 
 	// Seed currentAccent from the nearest header that sits above the current
 	// scroll window.  Without this, items whose section header has already
@@ -332,6 +333,9 @@ func (m *SearchModel) View() string {
 		row := m.rows[i]
 
 		if row.header {
+			if compact {
+				continue
+			}
 			currentAccent = sectionColor(row.label)
 			hs := lipgloss.NewStyle().
 				Foreground(currentAccent).
@@ -342,8 +346,10 @@ func (m *SearchModel) View() string {
 			continue
 		}
 
-		// Item rows require 2 lines; skip if there is not enough room.
-		if linesLeft < 2 {
+		// In a short terminal the search area can have only one line after its
+		// input and footer. Always show at least the selected item's identity;
+		// the normal two-line title/description layout is used when space permits.
+		if linesLeft < 1 {
 			break
 		}
 
@@ -363,7 +369,9 @@ func (m *SearchModel) View() string {
 		case row.track != nil:
 			t := row.track
 			sb.WriteString(cur + tStyle.Render(t.Title) + "\n")
-			sb.WriteString("    " + dStyle.Render(fmt.Sprintf("%s — %s", t.Artist, t.Album)) + "\n")
+			if !compact && linesLeft >= 2 {
+				sb.WriteString("    " + dStyle.Render(fmt.Sprintf("%s — %s", t.Artist, t.Album)) + "\n")
+			}
 
 		case row.album != nil:
 			a := row.album
@@ -372,7 +380,9 @@ func (m *SearchModel) View() string {
 				desc += fmt.Sprintf("  ·  %d tracks", a.TrackCount)
 			}
 			sb.WriteString(cur + tStyle.Render(a.Title) + tagStyle.Render(" [album]") + "\n")
-			sb.WriteString("    " + dStyle.Render(desc) + "\n")
+			if !compact && linesLeft >= 2 {
+				sb.WriteString("    " + dStyle.Render(desc) + "\n")
+			}
 
 		case row.playlist != nil:
 			p := row.playlist
@@ -381,9 +391,15 @@ func (m *SearchModel) View() string {
 				desc = fmt.Sprintf("%d tracks", p.TrackCount)
 			}
 			sb.WriteString(cur + tStyle.Render(p.Name) + tagStyle.Render(" [playlist]") + "\n")
-			sb.WriteString("    " + dStyle.Render(desc) + "\n")
+			if !compact && linesLeft >= 2 {
+				sb.WriteString("    " + dStyle.Render(desc) + "\n")
+			}
 		}
-		linesLeft -= 2
+		if compact {
+			linesLeft--
+		} else {
+			linesLeft -= 2
+		}
 	}
 
 	return sb.String()

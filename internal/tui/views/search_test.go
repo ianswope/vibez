@@ -412,6 +412,18 @@ func TestSearch_SetResults_TracksAlbumsPlaylists(t *testing.T) {
 	}
 }
 
+func TestSearch_ViewShowsSelectedItemInOneLineViewport(t *testing.T) {
+	s := NewSearch(nil)
+	s.SetSize(40, 1)
+	s.SetResults(&provider.SearchResult{Tracks: []provider.Track{
+		{Title: "Wish You Were Here", Artist: "Pink Floyd", CatalogID: "1"},
+	}}, false, nil)
+
+	if got := s.View(); !strings.Contains(got, "Wish You Were Here") {
+		t.Fatalf("one-line View() hid the selectable result: %q", got)
+	}
+}
+
 func TestSearch_SetResults_OnlyAlbums(t *testing.T) {
 	s := NewSearch(nil)
 	s.SetSize(80, 20)
