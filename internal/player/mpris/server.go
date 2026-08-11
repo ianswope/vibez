@@ -414,18 +414,27 @@ func (s *Server) flush() {
 		}
 	}
 
+	// Every key is written on every update, including empty ones. godbus merges
+	// into the map it already holds (dbus.Store -> storeMapIntoMap) rather than
+	// replacing it, so a key we omit keeps the previous track's value instead of
+	// disappearing: a track without artwork would still advertise the last
+	// track's mpris:artUrl. Removing keys properly needs the export change in
+	// #110; until then a constant key set is what keeps metadata truthful.
 	meta := map[string]dbus.Variant{
 		"mpris:trackid": dbus.MakeVariant(noTrackPath),
+		"mpris:length":  dbus.MakeVariant(int64(0)),
+		"mpris:artUrl":  dbus.MakeVariant(""),
+		"xesam:title":   dbus.MakeVariant(""),
+		"xesam:artist":  dbus.MakeVariant([]string{}),
+		"xesam:album":   dbus.MakeVariant(""),
 	}
 	if t := st.Track; t != nil {
 		meta["mpris:trackid"] = dbus.MakeVariant(trackPath)
+		meta["mpris:length"] = dbus.MakeVariant(t.Duration.Microseconds())
+		meta["mpris:artUrl"] = dbus.MakeVariant(t.ArtworkURL)
 		meta["xesam:title"] = dbus.MakeVariant(t.Title)
 		meta["xesam:artist"] = dbus.MakeVariant([]string{t.Artist})
 		meta["xesam:album"] = dbus.MakeVariant(t.Album)
-		meta["mpris:length"] = dbus.MakeVariant(t.Duration.Microseconds())
-		if t.ArtworkURL != "" {
-			meta["mpris:artUrl"] = dbus.MakeVariant(t.ArtworkURL)
-		}
 	}
 
 	if !s.trySetProperty("PlaybackStatus", status) {

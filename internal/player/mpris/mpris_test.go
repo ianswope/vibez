@@ -904,3 +904,94 @@ func TestServer_UpdateAfterBusLossDoesNotPanic(t *testing.T) {
 	}
 	_ = srv.Close()
 }
+
+// --- metadata key lifetime ---
+
+func currentMetadata(t *testing.T, srv *Server) map[string]dbus.Variant {
+	t.Helper()
+	meta, ok := srv.props.GetMust(mprisPlayerIface, "Metadata").(map[string]dbus.Variant)
+	if !ok {
+		t.Fatal("Metadata property is not a map[string]dbus.Variant")
+	}
+	return meta
+}
+
+// godbus merges each update into the map it already holds, so a key left out of
+// one update keeps the previous track's value instead of disappearing.
+func TestServer_Update_ClearsStaleMetadataKeys(t *testing.T) {
+	ctrl := &mockController{}
+	srv, err := NewServer(ctrl)
+	if err != nil {
+		t.Skipf("NewServer failed: %v", err)
+	}
+	defer srv.Close() //nolint:errcheck
+
+	withArt := &provider.Track{
+		ID:         "with-art",
+		Title:      "Has Art",
+		Artist:     "First Artist",
+		Album:      "First Album",
+		Duration:   3 * time.Minute,
+		ArtworkURL: "https://example.com/cover.jpg",
+	}
+	srv.Update(player.State{Playing: true, Track: withArt, Position: time.Second})
+	srv.flush()
+
+	if got := currentMetadata(t, srv)["mpris:artUrl"].Value(); got != withArt.ArtworkURL {
+		t.Fatalf("mpris:artUrl = %v, want %q", got, withArt.ArtworkURL)
+	}
+
+	noArt := &provider.Track{
+		ID:       "no-art",
+		Title:    "No Art",
+		Artist:   "Second Artist",
+		Duration: 2 * time.Minute,
+	}
+	srv.Update(player.State{Playing: true, Track: noArt, Position: time.Second})
+	srv.flush()
+
+	meta := currentMetadata(t, srv)
+	if got := meta["mpris:artUrl"].Value(); got != "" {
+		t.Errorf("mpris:artUrl = %v, want empty for a track without artwork", got)
+	}
+	if got := meta["xesam:album"].Value(); got != "" {
+		t.Errorf("xesam:album = %v, want empty for a track without an album", got)
+	}
+}
+
+func TestServer_Update_ClearsMetadataWhenTrackGoesAway(t *testing.T) {
+	ctrl := &mockController{}
+	srv, err := NewServer(ctrl)
+	if err != nil {
+		t.Skipf("NewServer failed: %v", err)
+	}
+	defer srv.Close() //nolint:errcheck
+
+	srv.Update(player.State{Playing: true, Position: time.Second, Track: &provider.Track{
+		ID:       "going-away",
+		Title:    "Departing",
+		Artist:   "Departing Artist",
+		Album:    "Departing Album",
+		Duration: 4 * time.Minute,
+	}})
+	srv.flush()
+
+	srv.Update(player.State{Playing: false})
+	srv.flush()
+
+	meta := currentMetadata(t, srv)
+	if got := meta["mpris:trackid"].Value(); got != noTrackPath {
+		t.Errorf("mpris:trackid = %v, want %v", got, noTrackPath)
+	}
+	for _, key := range []string{"xesam:title", "xesam:album"} {
+		if got := meta[key].Value(); got != "" {
+			t.Errorf("%s = %v, want empty once no track is playing", key, got)
+		}
+	}
+	if got := meta["mpris:length"].Value(); got != int64(0) {
+		t.Errorf("mpris:length = %v, want 0 once no track is playing", got)
+	}
+	if got, ok := meta["xesam:artist"].Value().([]string); !ok || len(got) != 0 {
+		t.Errorf("xesam:artist = %v, want empty once no track is playing", meta["xesam:artist"].Value())
+	}
+}
