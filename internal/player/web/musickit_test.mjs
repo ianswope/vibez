@@ -416,6 +416,323 @@ test('lossless/unsupported values are rejected with web max', () => {
   }
 });
 
+// ─── Native queue mode (#96) ──────────────────────────────────────────────────
+// _allCatalog and _nativeHasNext are copied verbatim from musickit.html.
+// The rest simulate the decision each call site makes, in the same style as the
+// _busy/playbackStateDidChange tests above.
+
+const _allCatalog = (items) => items.every(item => !item.id.startsWith('i.'));
+
+function _nativeHasNext(m) {
+  if (m.repeatMode === 1 || m.repeatMode === 2) return true; // repeats itself
+  const q = m.queue;
+  if (!q || typeof q.length !== 'number' || typeof q.position !== 'number') return false;
+  return q.position < q.length - 1;
+}
+
+console.log('\n_allCatalog()');
+test('all catalog ids → true', () =>
+  eq(_allCatalog([{ id: '1' }, { id: '2' }]), true));
+test('any library id → false', () =>
+  eq(_allCatalog([{ id: '1' }, { id: 'i.abc' }]), false));
+test('all library ids → false', () =>
+  eq(_allCatalog([{ id: 'i.a' }, { id: 'i.b' }]), false));
+
+console.log('\n_nativeHasNext()');
+test('repeat-one always has a next', () =>
+  eq(_nativeHasNext({ repeatMode: 1, queue: { position: 4, length: 5 } }), true));
+test('repeat-all always has a next, including the last item', () =>
+  eq(_nativeHasNext({ repeatMode: 2, queue: { position: 4, length: 5 } }), true));
+test('mid-queue with repeat off → true', () =>
+  eq(_nativeHasNext({ repeatMode: 0, queue: { position: 0, length: 3 } }), true));
+test('last item with repeat off → false', () =>
+  eq(_nativeHasNext({ repeatMode: 0, queue: { position: 2, length: 3 } }), false));
+test('missing queue → false (vibez takes over)', () =>
+  eq(_nativeHasNext({ repeatMode: 0 }), false));
+test('non-numeric queue shape → false (vibez takes over)', () => {
+  eq(_nativeHasNext({ repeatMode: 0, queue: { position: '1', length: 3 } }), false);
+  eq(_nativeHasNext({ repeatMode: 0, queue: { position: 1, length: null } }), false);
+});
+test('single-item native queue with repeat off → false', () =>
+  eq(_nativeHasNext({ repeatMode: 0, queue: { position: 0, length: 1 } }), false));
+
+console.log('\nNative mode entry condition');
+const wantsNative = (items) => items.length > 1 && _allCatalog(items);
+test('multi-item all-catalog → native', () =>
+  eq(wantsNative([{ id: '1' }, { id: '2' }]), true));
+test('single catalog item → one-item mode', () =>
+  eq(wantsNative([{ id: '1' }]), false));
+test('multi-item with a library id → one-item mode', () =>
+  eq(wantsNative([{ id: '1' }, { id: 'i.x' }]), false));
+test('empty → one-item mode', () => eq(wantsNative([]), false));
+
+console.log('\ncompleted handler: who advances');
+// Mirrors musickit.html playbackStateDidChange: native short-circuit, diverged
+// stop, then the pre-existing one-item logic.
+const onCompleted = (s) => {
+  const out = { playAt: null, clearedNative: false, advanced: false };
+  if (s.nativeQueue && _nativeHasNext(s.m)) return out;      // MusicKit advances
+  if (s.nativeQueue && !s.nativeMirrors) { out.clearedNative = true; return out; }
+  if (s.busy || s.qi < 0 || s.q.length === 0) return out;
+  if (s.m.repeatMode === 1) { out.playAt = s.qi; out.advanced = true; return out; }
+  const next = s.qi + 1;
+  if (next < s.q.length)     { out.playAt = next; out.advanced = true; return out; }
+  if (s.m.repeatMode === 2)  { out.playAt = 0;    out.advanced = true; }
+  return out;
+};
+const base = { nativeQueue: false, nativeMirrors: false, busy: false, qi: 0, q: ['a', 'b', 'c'] };
+
+test('native with a next: vibez does not advance (no double advance)', () => {
+  const r = onCompleted({ ...base, nativeQueue: true, nativeMirrors: true,
+                          m: { repeatMode: 0, queue: { position: 0, length: 3 } } });
+  eq(r.advanced, false);
+  eq(r.clearedNative, false, 'authority must stay with MusicKit while it has a next');
+});
+test('native repeat-all at the last item: MusicKit laps, vibez stays out', () => {
+  const r = onCompleted({ ...base, nativeQueue: true, nativeMirrors: true, qi: 2,
+                          m: { repeatMode: 2, queue: { position: 2, length: 3 } } });
+  eq(r.advanced, false);
+});
+test('native exhausted while mirroring: vibez resumes at _qi+1', () => {
+  const r = onCompleted({ ...base, nativeQueue: true, nativeMirrors: true, qi: 1,
+                          m: { repeatMode: 0, queue: { position: 2, length: 2 } } });
+  eq(r.playAt, 2, 'should pick up the appended tail');
+});
+test('native exhausted with order diverged: stops instead of playing an arbitrary index', () => {
+  const r = onCompleted({ ...base, nativeQueue: true, nativeMirrors: false, qi: 1,
+                          m: { repeatMode: 0, queue: { position: 2, length: 2 } } });
+  eq(r.advanced, false, 'must not resume at _qi+1 after a shuffle');
+  eq(r.clearedNative, true, 'safe to drop authority: MusicKit has nowhere to go');
+});
+test('one-item mode is unchanged: advance, repeat-one, repeat-all', () => {
+  eq(onCompleted({ ...base, m: { repeatMode: 0 } }).playAt, 1);
+  eq(onCompleted({ ...base, qi: 1, m: { repeatMode: 1 } }).playAt, 1);
+  eq(onCompleted({ ...base, qi: 2, m: { repeatMode: 2 } }).playAt, 0);
+  eq(onCompleted({ ...base, qi: 2, m: { repeatMode: 0 } }).playAt, null);
+});
+test('_busy suppresses the one-item path but not the native short-circuit', () => {
+  eq(onCompleted({ ...base, busy: true, m: { repeatMode: 0 } }).playAt, null);
+  const r = onCompleted({ ...base, nativeQueue: true, nativeMirrors: true, busy: true,
+                          m: { repeatMode: 0, queue: { position: 0, length: 3 } } });
+  eq(r.advanced, false);
+});
+
+console.log('\nPending jump keeps its native intent');
+// _playNativeAt + _runPending: the native flag travels with the index so a
+// deferred build cannot silently downgrade to one-item mode.
+const makePending = () => {
+  const s = { busy: false, wantIdx: -1, wantNative: false, q: ['a', 'b', 'c'], calls: [] };
+  s.playNativeAt = (idx) => {
+    if (s.busy) { s.wantIdx = idx; s.wantNative = true; return; }
+    s.calls.push(['native', idx]);
+  };
+  s.playAt = (idx) => {
+    if (s.busy) { s.wantIdx = idx; s.wantNative = false; return; }
+    s.calls.push(['one', idx]);
+  };
+  s.runPending = () => {
+    if (s.wantIdx < 0 || s.wantIdx >= s.q.length) return;
+    const next = s.wantIdx, native = s.wantNative;
+    s.wantIdx = -1; s.wantNative = false;
+    if (native) s.calls.push(['native', next]);
+    else        s.calls.push(['one', next]);
+  };
+  return s;
+};
+
+test('_playNativeAt while busy defers instead of building', () => {
+  const s = makePending();
+  s.busy = true;
+  s.playNativeAt(1);
+  eq(s.calls, [], 'must not build while another build is in flight');
+  eq([s.wantIdx, s.wantNative], [1, true]);
+});
+test('deferred native jump runs as native, not one-item', () => {
+  const s = makePending();
+  s.busy = true; s.playNativeAt(2);
+  s.busy = false; s.runPending();
+  eq(s.calls, [['native', 2]], 'a deferred native build must not downgrade');
+});
+test('deferred one-item jump stays one-item', () => {
+  const s = makePending();
+  s.busy = true; s.playAt(1);
+  s.busy = false; s.runPending();
+  eq(s.calls, [['one', 1]]);
+});
+test('_runPending clears both fields before dispatching', () => {
+  const s = makePending();
+  s.busy = true; s.playNativeAt(1);
+  s.busy = false; s.runPending();
+  eq([s.wantIdx, s.wantNative], [-1, false]);
+  s.runPending();
+  eq(s.calls.length, 1, 'a consumed pending jump must not run twice');
+});
+test('_runPending ignores an out-of-range pending index', () => {
+  const s = makePending();
+  s.wantIdx = 9; s.wantNative = true;
+  s.runPending();
+  eq(s.calls, []);
+});
+
+console.log('\nQueue edits and advance authority');
+// Authority may only be dropped alongside a stop()/setQueue that actually takes
+// it back — clearing the flag on its own leaves two advancers running.
+const makeQueueState = () => ({
+  q: [{ id: '1' }, { id: '2' }, { id: '3' }],
+  qi: 1, nativeQueue: true, nativeMirrors: true,
+  removedIds: new Set(), stopped: false, rebuiltAt: null,
+});
+const removeAt = (s, idx) => {
+  if (idx < 0 || idx >= s.q.length) return s;
+  if (idx === s.qi) {
+    s.q.splice(idx, 1);
+    if (s.q.length === 0) {
+      s.qi = -1; s.nativeQueue = false; s.nativeMirrors = false;
+      s.removedIds = new Set(); s.stopped = true; return s;
+    }
+    if (s.qi >= s.q.length) s.qi = s.q.length - 1;
+    s.rebuiltAt = s.qi; // _playAt rebuilds one-item, which takes authority back
+    return s;
+  }
+  const removed = s.q[idx];
+  s.q.splice(idx, 1);
+  if (idx < s.qi) s.qi--;
+  if (s.nativeQueue && removed && !s.q.some(i => i.id === removed.id)) s.removedIds.add(removed.id);
+  s.nativeMirrors = false;
+  return s;
+};
+
+test('removing a non-current item keeps authority but marks order diverged', () => {
+  const s = removeAt(makeQueueState(), 2);
+  eq(s.nativeQueue, true, 'MusicKit still holds the item — authority must not be dropped');
+  eq(s.nativeMirrors, false);
+  eq([...s.removedIds], ['3'], 'id remembered so it can be skipped on arrival');
+});
+test('removing before the current item shifts _qi', () => {
+  const s = removeAt(makeQueueState(), 0);
+  eq(s.qi, 0);
+});
+test('removing the current item rebuilds, which takes authority back', () => {
+  const s = removeAt(makeQueueState(), 1);
+  eq(s.rebuiltAt, 1);
+});
+test('removing the last remaining item drops authority together with a stop', () => {
+  const s = makeQueueState();
+  s.q = [{ id: '1' }]; s.qi = 0;
+  removeAt(s, 0);
+  eq(s.nativeQueue, false);
+  eq(s.stopped, true, 'authority may only be cleared alongside a stop');
+});
+test('clearing the queue drops authority together with a stop', () => {
+  const s = makeQueueState();
+  s.q = []; s.qi = -1; s.nativeQueue = false; s.nativeMirrors = false; s.stopped = true;
+  eq([s.nativeQueue, s.stopped], [false, true]);
+});
+test('reorder is view-only: authority kept, mirroring broken', () => {
+  const s = makeQueueState();
+  s.nativeMirrors = false; // vibezQueueMove leaves _nativeQueue alone
+  eq([s.nativeQueue, s.nativeMirrors], [true, false]);
+});
+
+console.log('\nSkip-on-arrival for removed items');
+const onNowPlayingChange = (s, playingId) => {
+  const out = { qi: s.qi, skipped: false, stopped: false, clearedNative: false };
+  if (!s.nativeQueue) return out;
+  if (!playingId) return out;
+  const idx = s.q.findIndex(i => i.id === playingId);
+  if (idx >= 0) { out.qi = idx; return out; }
+  if (s.removedIds.has(playingId)) {
+    if (_nativeHasNext(s.m)) { out.skipped = true; return out; }
+    out.clearedNative = true; out.stopped = true;
+  }
+  return out;
+};
+
+test('playing an item still in _q resettles _qi', () => {
+  const s = { ...makeQueueState(), m: { repeatMode: 0, queue: { position: 2, length: 3 } } };
+  eq(onNowPlayingChange(s, '3').qi, 2);
+});
+test('a removed item that starts is skipped when MusicKit has a next', () => {
+  const s = { ...makeQueueState(), removedIds: new Set(['9']),
+              m: { repeatMode: 0, queue: { position: 1, length: 3 } } };
+  eq(onNowPlayingChange(s, '9').skipped, true);
+});
+test('a removed last item ends the queue rather than playing out', () => {
+  const s = { ...makeQueueState(), removedIds: new Set(['9']),
+              m: { repeatMode: 0, queue: { position: 2, length: 3 } } };
+  const r = onNowPlayingChange(s, '9');
+  eq([r.skipped, r.stopped, r.clearedNative], [false, true, true]);
+});
+test('an unknown item that was never removed is left alone', () => {
+  const s = { ...makeQueueState(), m: { repeatMode: 0, queue: { position: 1, length: 3 } } };
+  const r = onNowPlayingChange(s, 'surprise');
+  eq([r.skipped, r.stopped], [false, false]);
+});
+test('nothing happens in one-item mode', () => {
+  const s = { ...makeQueueState(), nativeQueue: false, removedIds: new Set(['9']),
+              m: { repeatMode: 0, queue: { position: 0, length: 3 } } };
+  eq(onNowPlayingChange(s, '9').skipped, false);
+});
+
+console.log('\nnext/prev delegate while MusicKit owns the queue');
+const onNext = (s) => (s.nativeQueue && _nativeHasNext(s.m))
+  ? { skipToNext: true, playAt: null }
+  : { skipToNext: false, playAt: s.qi < s.q.length - 1 ? s.qi + 1 : null };
+const onPrev = (s) => (s.nativeQueue && (s.m.queue?.position ?? 0) > 0)
+  ? { skipToPrev: true, playAt: null }
+  : { skipToPrev: false, playAt: s.qi > 0 ? s.qi - 1 : 0 };
+
+test('next delegates to skipToNextItem in native mode', () => {
+  const s = { ...makeQueueState(), m: { repeatMode: 0, queue: { position: 1, length: 3 } } };
+  eq(onNext(s).skipToNext, true);
+});
+test('next falls back to _playAt once the native queue is exhausted', () => {
+  const s = { ...makeQueueState(), m: { repeatMode: 0, queue: { position: 2, length: 3 } } };
+  eq(onNext(s), { skipToNext: false, playAt: 2 });
+});
+test('prev delegates to skipToPreviousItem when MusicKit is past the start', () => {
+  const s = { ...makeQueueState(), m: { repeatMode: 0, queue: { position: 1, length: 3 } } };
+  eq(onPrev(s).skipToPrev, true);
+});
+test('prev at the native queue start uses _playAt', () => {
+  const s = { ...makeQueueState(), m: { repeatMode: 0, queue: { position: 0, length: 3 } } };
+  eq(onPrev(s), { skipToPrev: false, playAt: 0 });
+});
+
+console.log('\nAppend against a live native queue');
+// playLater failure must not clear _nativeQueue: MusicKit still owns what it
+// has, and the completed handler picks the tail up once it runs out.
+const onAppend = (s, items, playLaterThrows) => {
+  s.q = s.q.concat(items);
+  if (s.qi < 0) { s.rebuiltAt = 0; return s; }
+  if (s.nativeQueue && _allCatalog(items)) {
+    if (playLaterThrows) return s; // flag deliberately left set
+    s.playLater = items.map(i => i.id);
+  }
+  return s;
+};
+
+test('appending catalog items to a native queue uses playLater', () => {
+  const s = onAppend(makeQueueState(), [{ id: '4' }], false);
+  eq(s.playLater, ['4']);
+  eq(s.nativeQueue, true);
+});
+test('playLater failure keeps authority so the boundary does not double up', () => {
+  const s = onAppend(makeQueueState(), [{ id: '4' }], true);
+  eq(s.nativeQueue, true, 'clearing here would add a second advancer');
+  eq(s.q.length, 4, 'the item is still in _q for the completed handler to reach');
+});
+test('appending a library item to a native queue does not use playLater', () => {
+  const s = onAppend(makeQueueState(), [{ id: 'i.x' }], false);
+  eq(s.playLater, undefined);
+});
+test('appending while nothing plays starts playback', () => {
+  const s = makeQueueState();
+  s.qi = -1;
+  onAppend(s, [{ id: '4' }], false);
+  eq(s.rebuiltAt, 0);
+});
+
 
 console.log(`\n${passed + failed} tests: ${passed} passed, ${failed} failed`);
 if (failed > 0) process.exit(1);
