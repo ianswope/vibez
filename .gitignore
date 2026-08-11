@@ -12,7 +12,11 @@ release_notes.md
 
 # Config (personal credentials must not be committed)
 .env
+.env.*
+!.env.example
 *.p8
+*.pem
+*.key
 
 # Editor
 .vscode/
