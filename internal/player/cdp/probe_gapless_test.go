@@ -8,7 +8,7 @@
 // It is a test purely so it can reach those helpers. It is skipped unless
 // VIBEZ_PROBE=1, so `go test ./...` and CI are unaffected.
 //
-//	VIBEZ_PROBE=1 VIBEZ_PROBE_IDS=1440857781,1440857782,1440857783 \
+//	VIBEZ_PROBE=1 VIBEZ_PROBE_IDS=1665303761,1665303762,1665303763 \
 //	  go test ./internal/player/cdp -run TestProbeGapless -v -timeout 5m
 //
 // Pick consecutive tracks from an album you know is mastered gapless; that is

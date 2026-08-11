@@ -1,0 +1,363 @@
+<!DOCTYPE html>
+<!--
+  PROTOTYPE INSTRUMENT — issue #96 (seamless transitions). Not shipped.
+
+  probe_gapless.html established that setQueue({songs:[id,...]}) builds a real
+  multi-item native queue and that advancing it costs ~20ms instead of ~850ms.
+  Every phase there used the songs: form, so one question stayed unanswered —
+  and it is the question that decides whether library items can join a native
+  queue at all:
+
+    1. Does setQueue({items:[resolvedObject,...]}) build a MULTI-item native
+       queue, or does the items: form only ever hold one?
+    2. If it does, is advancing it as cheap as the songs: form — same single
+       media element, same ~20ms — or does it behave like a rebuild?
+    3. Can one queue MIX catalog songs and library-songs objects?
+    4. Does setQueue({songs:['i.XXXX']}) really refuse library IDs? musickit.html
+       asserts this to justify keeping library items on the one-item path, but
+       the assertion was never measured.
+
+  Phases are independent: each one re-establishes playback, so a failure earlier
+  does not silently invalidate a later result. Nothing here is a behavioural
+  claim — it records what happened and lets the caller judge.
+-->
+<html>
+  <head><meta charset="utf-8"><title>vibez items-queue probe</title></head>
+  <body>
+    <script>
+      window.addEventListener('error',   (e) => window.__fail?.(e.message || 'window error'));
+      window.addEventListener('unhandledrejection', (e) => window.__fail?.(String(e.reason)));
+    </script>
+    <script>
+      document.addEventListener('musickitloaded', async function () {
+        const RESULT = { musickitVersion: null, phases: [], errors: [] };
+        const errStr = (e) => (e && (e.name ? e.name + (e.message ? ': ' + e.message : '') : e.message)) || String(e);
+        const fail = (stage, e) => { RESULT.errors.push({ stage, error: errStr(e) }); };
+        window.__fail = (msg) => { fail('window', msg); flush(); };
+        let flushed = false;
+        const flush = () => {
+          if (flushed) return;
+          flushed = true;
+          goProbeResult(JSON.stringify(RESULT)).catch(() => {});
+        };
+
+        try {
+          await MusicKit.configure({
+            developerToken: '{{.DeveloperToken}}',
+            app: { name: 'vibez-probe', build: 'probe' },
+          });
+          const m = () => MusicKit.getInstance();
+          if ('{{.UserToken}}') m().musicUserToken = '{{.UserToken}}';
+          RESULT.musickitVersion = MusicKit.version || null;
+          RESULT.storefront = m().storefrontId || null;
+
+          // ── instrumentation (same method as probe_gapless.html) ───────────
+          const mediaSnapshot = () => Array.from(document.querySelectorAll('audio,video')).map((el, i) => ({
+            i,
+            ct: +(el.currentTime || 0).toFixed(3),
+            paused: !!el.paused,
+            src: (el.currentSrc || '').slice(-28) || null,
+          }));
+          let timeline = [], t0 = 0, poll = null;
+          const stamp = (kind, extra) => {
+            const inst = m();
+            timeline.push(Object.assign({
+              t: +(performance.now() - t0).toFixed(1),
+              kind,
+              stateNum: inst.playbackState,
+              itemId: inst.nowPlayingItem?.id ?? null,
+              qpos: inst.queue?.position,
+              media: mediaSnapshot(),
+            }, extra || {}));
+          };
+          const onState = () => stamp('playbackStateDidChange');
+          const onItem  = () => stamp('nowPlayingItemDidChange');
+          const startRecording = () => {
+            timeline = []; t0 = performance.now();
+            m().addEventListener('playbackStateDidChange', onState);
+            m().addEventListener('nowPlayingItemDidChange', onItem);
+            poll = setInterval(() => stamp('poll'), 50);
+          };
+          const stopRecording = () => {
+            clearInterval(poll);
+            m().removeEventListener('playbackStateDidChange', onState);
+            m().removeEventListener('nowPlayingItemDidChange', onItem);
+            return timeline.slice();
+          };
+          // "Advancing" requires currentTime to move on an unpaused element
+          // matched by index+src, so a src swap resetting currentTime to 0 is
+          // never mistaken for progress.
+          const deriveGapMedia = (tl, firstId) => {
+            let prev = null, lastA = null, firstB = null;
+            const advancing = (e) => {
+              if (!prev || !prev.media || !e.media) return false;
+              for (const cur of e.media) {
+                const p = prev.media.find(x => x.i === cur.i && x.src === cur.src);
+                if (p && !cur.paused && cur.ct - p.ct > 0.002) return true;
+              }
+              return false;
+            };
+            for (const e of tl) {
+              if (advancing(e)) {
+                if (e.itemId === firstId) lastA = e.t;
+                else if (e.itemId && lastA !== null && firstB === null) firstB = e.t;
+              }
+              prev = e;
+            }
+            return (lastA !== null && firstB !== null)
+              ? { gapMs: +(firstB - lastA).toFixed(1), source: 'media-element currentTime, 50ms poll' }
+              : { gapMs: null, note: 'could not observe media currentTime advancing on both tracks' };
+          };
+          const distinctSrcs = (tl) => {
+            const s = new Set();
+            for (const e of tl) for (const mm of (e.media || [])) if (mm.src) s.add(mm.src);
+            return [...s];
+          };
+
+          const waitFor = (pred, ms) => new Promise(res => {
+            const iv = setInterval(() => { if (pred()) { clearInterval(iv); clearTimeout(to); res(true); } }, 40);
+            const to = setTimeout(() => { clearInterval(iv); res(false); }, ms);
+          });
+          const settle = async () => { try { await m().stop(); } catch (_) {} await new Promise(r => setTimeout(r, 600)); };
+          // MusicKit rejects play() when it is already playing, which shows up as
+          // a page error and tells us nothing.
+          const playIfNeeded = async () => { if (m().playbackState !== 2) await m().play(); };
+          // Did any media element actually make progress? Used where a state
+          // label alone would not prove audio is playing.
+          const sawMediaProgress = (tl) => {
+            let prev = null;
+            for (const e of tl) {
+              if (prev) {
+                for (const cur of (e.media || [])) {
+                  const p = (prev.media || []).find(x => x.i === cur.i && x.src === cur.src);
+                  if (p && !cur.paused && cur.ct - p.ct > 0.002) return true;
+                }
+              }
+              prev = e;
+            }
+            return false;
+          };
+          const queueShape = () => ({
+            length: m().queue?.length ?? null,
+            position: m().queue?.position ?? null,
+            itemIds: (m().queue?.items ?? []).map(i => i.id),
+            itemTypes: (m().queue?.items ?? []).map(i => i.type ?? null),
+          });
+
+          const IDS = {{.IDsJSON}};
+          const LEAD_S = {{.LeadSeconds}};
+          const TAIL_MS = {{.TailMs}};
+          const sf = m().storefrontId || '{{.Storefront}}' || 'us';
+
+          // Resolve catalog IDs to full objects, exactly as _resolveItems() does.
+          let catalog = [];
+          try {
+            const r = await m().api.music(`/v1/catalog/${sf}/songs`, { ids: IDS, include: 'library' });
+            catalog = r?.data?.data ?? [];
+            RESULT.resolvedCatalog = catalog.map(s => ({
+              id: s.id, type: s.type, name: s.attributes?.name,
+              // Present when the user owns a library copy — the _libMap source.
+              libraryId: s.relationships?.library?.data?.[0]?.id ?? null,
+            }));
+          } catch (e) { fail('resolve-catalog', e); flush(); return; }
+          if (catalog.length < 2) { fail('resolve-catalog', 'need >=2 catalog songs, got ' + catalog.length); flush(); return; }
+
+          // Library songs, for the mixed and library-only phases.
+          let library = [];
+          try {
+            const lr = await m().api.music('/v1/me/library/songs', { limit: 5 });
+            library = lr?.data?.data ?? [];
+            RESULT.librarySongs = library.map(s => ({ id: s.id, type: s.type, name: s.attributes?.name }));
+          } catch (e) { fail('list-library', e); }
+
+          const runPhase = async (name, fn) => {
+            const ph = { name };
+            await settle();
+            try { await fn(ph); } catch (e) { ph.error = errStr(e); }
+            RESULT.phases.push(ph);
+          };
+
+          // ── PHASE 1 — items: with several catalog objects ──────────────────
+          // The core question. If this builds length>1 the items: form is not
+          // limited to a single item, and a mixed queue becomes expressible.
+          await runPhase('items:[catalog objects] — multi-item?', async (ph) => {
+            await m().setQueue({ items: catalog });
+            ph.afterSetQueue = queueShape();
+            ph.multiItemBuilt = (m().queue?.length ?? 0) > 1;
+            await playIfNeeded();
+            ph.startedPlaying = await waitFor(() => m().playbackState === 2, 20000);
+            ph.nowPlayingId = m().nowPlayingItem?.id ?? null;
+          });
+
+          // ── PHASE 2 — is an items: queue as cheap to advance? ──────────────
+          // Only meaningful if phase 1 built a multi-item queue. Same boundary
+          // measurement as probe_gapless.html so the numbers are comparable.
+          const p1 = RESULT.phases[0];
+          if (p1 && p1.multiItemBuilt && p1.startedPlaying) {
+            await runPhase('items:[catalog objects] — boundary cost', async (ph) => {
+              await m().setQueue({ items: catalog });
+              await playIfNeeded();
+              const ok = await waitFor(() => m().playbackState === 2, 20000);
+              if (!ok) { ph.note = 'never reached playing'; return; }
+              const firstId = m().nowPlayingItem?.id ?? null;
+              ph.firstId = firstId;
+              startRecording();
+              const dur = (m().nowPlayingItem?.attributes?.durationInMillis ?? 0) / 1000;
+              if (dur > LEAD_S + 2) m().seekToTime(Math.max(0, dur - LEAD_S));
+              const changed = await waitFor(() => (m().nowPlayingItem?.id ?? null) !== firstId, (LEAD_S + 20) * 1000);
+              await new Promise(r => setTimeout(r, TAIL_MS));
+              const tl = stopRecording();
+              ph.advancedOnItsOwn = changed;
+              ph.secondId = m().nowPlayingItem?.id ?? null;
+              ph.gap = deriveGapMedia(tl, firstId);
+              ph.distinctMediaSrcs = distinctSrcs(tl).length;
+              ph.queueAfter = queueShape();
+            });
+          } else {
+            RESULT.phases.push({ name: 'items:[catalog objects] — boundary cost',
+                                 skipped: 'phase 1 did not build a playing multi-item queue' });
+          }
+
+          // ── PHASE 3 — mixed catalog + library in ONE items: queue ──────────
+          // Simone's suggestion on #96, tested directly. skipToNextItem is used
+          // rather than a natural boundary: this asks whether the queue is
+          // expressible and navigable, not what it costs.
+          if (library.length >= 1) {
+            await runPhase('items:[catalog + library] — mixed queue accepted?', async (ph) => {
+              const mixed = [catalog[0], library[0]];
+              ph.requested = mixed.map(i => ({ id: i.id, type: i.type }));
+              await m().setQueue({ items: mixed });
+              ph.afterSetQueue = queueShape();
+              ph.multiItemBuilt = (m().queue?.length ?? 0) > 1;
+              ph.bothItemsPresent = (m().queue?.items ?? []).length === 2;
+              await playIfNeeded();
+              ph.startedPlaying = await waitFor(() => m().playbackState === 2, 20000);
+              ph.firstPlayingId = m().nowPlayingItem?.id ?? null;
+              if (ph.multiItemBuilt) {
+                try {
+                  await m().skipToNextItem();
+                  ph.skippedToSecond = await waitFor(
+                    () => (m().nowPlayingItem?.id ?? null) === library[0].id, 20000);
+                  ph.secondPlayingId = m().nowPlayingItem?.id ?? null;
+                  ph.playingAfterSkip = m().playbackState === 2;
+                } catch (e) { ph.skipError = errStr(e); }
+              }
+            });
+          } else {
+            RESULT.phases.push({ name: 'items:[catalog + library] — mixed queue accepted?',
+                                 skipped: 'no library songs available on this account' });
+          }
+
+          // ── PHASE 4 — library-only multi-item items: queue ─────────────────
+          if (library.length >= 2) {
+            await runPhase('items:[library only] — multi-item?', async (ph) => {
+              const two = library.slice(0, 2);
+              await m().setQueue({ items: two });
+              ph.afterSetQueue = queueShape();
+              ph.multiItemBuilt = (m().queue?.length ?? 0) > 1;
+              await playIfNeeded();
+              ph.startedPlaying = await waitFor(() => m().playbackState === 2, 20000);
+              ph.nowPlayingId = m().nowPlayingItem?.id ?? null;
+            });
+          } else {
+            RESULT.phases.push({ name: 'items:[library only] — multi-item?',
+                                 skipped: 'need >=2 library songs' });
+          }
+
+          // ── PHASE 5 — does songs: really refuse a library ID? ──────────────
+          // musickit.html asserts it cannot express library items. Measure it.
+          if (library.length >= 1) {
+            await runPhase('songs:[catalog + library id] — does songs: refuse library IDs?', async (ph) => {
+              ph.requested = [catalog[0].id, library[0].id];
+              try {
+                await m().setQueue({ songs: [catalog[0].id, library[0].id] });
+                ph.setQueueThrew = false;
+              } catch (e) { ph.setQueueThrew = true; ph.setQueueError = errStr(e); }
+              ph.afterSetQueue = queueShape();
+              // The interesting failure mode is silent: no throw, but the
+              // library ID is simply absent from the resulting queue.
+              ph.libraryIdInQueue = (m().queue?.items ?? []).some(i => i.id === library[0].id);
+            });
+          } else {
+            RESULT.phases.push({ name: 'songs:[catalog + library id] — does songs: refuse library IDs?',
+                                 skipped: 'no library songs available on this account' });
+          }
+
+          // ── PHASE 6 — mixed queue at a NATURAL boundary ────────────────────
+          // Phase 2 is the control: same album, same boundary, both items
+          // catalog. Here the second item is the user's own library copy of that
+          // same next track, so a difference in the gap isolates the item kind
+          // rather than the album, the transition, or the network.
+          const secondLibId = RESULT.resolvedCatalog?.[1]?.libraryId ?? null;
+          let secondLibObj = null;
+          if (secondLibId) {
+            try {
+              const lr = await m().api.music(`/v1/me/library/songs/${secondLibId}`);
+              secondLibObj = lr?.data?.data?.[0] ?? null;
+            } catch (e) { fail('fetch-library-copy', e); }
+          }
+          if (secondLibObj) {
+            await runPhase('items:[catalog, library copy of the SAME next track] — natural boundary', async (ph) => {
+              ph.requested = [{ id: catalog[0].id, type: catalog[0].type },
+                              { id: secondLibObj.id, type: secondLibObj.type }];
+              await m().setQueue({ items: [catalog[0], secondLibObj] });
+              ph.afterSetQueue = queueShape();
+              ph.multiItemBuilt = (m().queue?.length ?? 0) > 1;
+              await playIfNeeded();
+              ph.startedPlaying = await waitFor(() => m().playbackState === 2, 20000);
+              if (!ph.startedPlaying) { ph.note = 'never reached playing'; return; }
+              const firstId = m().nowPlayingItem?.id ?? null;
+              ph.firstId = firstId;
+              startRecording();
+              const dur = (m().nowPlayingItem?.attributes?.durationInMillis ?? 0) / 1000;
+              if (dur > LEAD_S + 2) m().seekToTime(Math.max(0, dur - LEAD_S));
+              // No skipToNextItem here: the question is whether MusicKit crosses
+              // a catalog → library boundary on its own, and at what cost.
+              ph.advancedOnItsOwn = await waitFor(
+                () => (m().nowPlayingItem?.id ?? null) !== firstId, (LEAD_S + 25) * 1000);
+              await new Promise(r => setTimeout(r, TAIL_MS));
+              const tl = stopRecording();
+              ph.secondId = m().nowPlayingItem?.id ?? null;
+              ph.reachedLibraryItem = ph.secondId === secondLibObj.id;
+              ph.gap = deriveGapMedia(tl, firstId);
+              ph.distinctMediaSrcs = distinctSrcs(tl).length;
+              ph.queueAfter = queueShape();
+            });
+          } else {
+            RESULT.phases.push({ name: 'items:[catalog, library copy of the SAME next track] — natural boundary',
+                                 skipped: 'no library copy for the second catalog track' });
+          }
+
+          // ── PHASE 7 — does a library ID in songs: actually PLAY? ───────────
+          // Phase 5 only showed the ID lands in the queue. Presence is not
+          // playability, so require a media element to actually advance.
+          if (secondLibId) {
+            await runPhase('songs:[library id] — does it actually play?', async (ph) => {
+              ph.requested = [secondLibId];
+              try { await m().setQueue({ songs: [secondLibId] }); ph.setQueueThrew = false; }
+              catch (e) { ph.setQueueThrew = true; ph.setQueueError = errStr(e); return; }
+              ph.afterSetQueue = queueShape();
+              startRecording();
+              try { await playIfNeeded(); } catch (e) { ph.playError = errStr(e); }
+              ph.startedPlaying = await waitFor(() => m().playbackState === 2, 20000);
+              await new Promise(r => setTimeout(r, 2500));
+              const tl = stopRecording();
+              ph.nowPlayingId = m().nowPlayingItem?.id ?? null;
+              ph.mediaActuallyAdvanced = sawMediaProgress(tl);
+            });
+          } else {
+            RESULT.phases.push({ name: 'songs:[library id] — does it actually play?',
+                                 skipped: 'no library copy id available' });
+          }
+
+          await settle();
+          flush();
+        } catch (e) {
+          fail('top', e);
+          flush();
+        }
+      });
+    </script>
+    <script src="https://js-cdn.music.apple.com/musickit/v3/musickit.js" data-web-components async></script>
+  </body>
+</html>

@@ -1,0 +1,247 @@
+<!DOCTYPE html>
+<!--
+  PROTOTYPE INSTRUMENT — issue #96 (seamless transitions). Not shipped.
+
+  probe_gapless.html and probe_items.html each measured a boundary ONCE per
+  design. Re-running the identical catalog/catalog native arm gave 15.9ms with
+  one media src and then 349.9ms with two, so a single sample is not a property
+  of the design and no number from those probes should be quoted on its own.
+
+  This instrument measures each arm REPEATEDLY and reports every sample, so the
+  caller can see a distribution instead of an anecdote:
+
+    rebuild             — today's behaviour: setQueue({songs:[one id]}) per
+                          track, advanced by us when the first reports completed
+    native-songs        — setQueue({songs:[id,...]}), MusicKit advances
+    native-items        — setQueue({items:[object,...]}), MusicKit advances
+    native-items-mixed  — setQueue({items:[catalog object, the user's library
+                          copy of the SAME next track]}), MusicKit advances
+
+  The arms are interleaved round-robin, not run in blocks: CDN warming, licence
+  caching and network drift all trend over time, and blocks would let that trend
+  masquerade as a difference between designs.
+
+  distinctMediaSrcs is reported per sample because it is the mechanism behind
+  the gap: a rebuild must swap the media element's src, and a swap cannot start
+  decoding until the previous item releases the element.
+-->
+<html>
+  <head><meta charset="utf-8"><title>vibez gap repeat probe</title></head>
+  <body>
+    <script>
+      window.addEventListener('error',   (e) => window.__fail?.(e.message || 'window error'));
+      window.addEventListener('unhandledrejection', (e) => window.__fail?.(String(e.reason)));
+    </script>
+    <script>
+      document.addEventListener('musickitloaded', async function () {
+        const RESULT = { musickitVersion: null, samples: [], errors: [] };
+        const errStr = (e) => (e && (e.name ? e.name + (e.message ? ': ' + e.message : '') : e.message)) || String(e);
+        const fail = (stage, e) => { RESULT.errors.push({ stage, error: errStr(e) }); };
+        window.__fail = (msg) => { fail('window', msg); flush(); };
+        let flushed = false;
+        const flush = () => {
+          if (flushed) return;
+          flushed = true;
+          goProbeResult(JSON.stringify(RESULT)).catch(() => {});
+        };
+
+        try {
+          await MusicKit.configure({
+            developerToken: '{{.DeveloperToken}}',
+            app: { name: 'vibez-probe', build: 'probe' },
+          });
+          const m = () => MusicKit.getInstance();
+          if ('{{.UserToken}}') m().musicUserToken = '{{.UserToken}}';
+          RESULT.musickitVersion = MusicKit.version || null;
+          RESULT.storefront = m().storefrontId || null;
+
+          const COMPLETED = (MusicKit.PlaybackStates && MusicKit.PlaybackStates.completed != null)
+            ? MusicKit.PlaybackStates.completed : 9;
+
+          const mediaSnapshot = () => Array.from(document.querySelectorAll('audio,video')).map((el, i) => ({
+            i,
+            ct: +(el.currentTime || 0).toFixed(3),
+            paused: !!el.paused,
+            src: (el.currentSrc || '').slice(-28) || null,
+          }));
+          let timeline = [], t0 = 0, poll = null;
+          const stamp = (kind) => {
+            const inst = m();
+            timeline.push({
+              t: +(performance.now() - t0).toFixed(1),
+              kind,
+              stateNum: inst.playbackState,
+              itemId: inst.nowPlayingItem?.id ?? null,
+              media: mediaSnapshot(),
+            });
+          };
+          const onState = () => stamp('playbackStateDidChange');
+          const onItem  = () => stamp('nowPlayingItemDidChange');
+          const startRecording = () => {
+            timeline = []; t0 = performance.now();
+            m().addEventListener('playbackStateDidChange', onState);
+            m().addEventListener('nowPlayingItemDidChange', onItem);
+            poll = setInterval(() => stamp('poll'), 50);
+          };
+          const stopRecording = () => {
+            clearInterval(poll);
+            m().removeEventListener('playbackStateDidChange', onState);
+            m().removeEventListener('nowPlayingItemDidChange', onItem);
+            return timeline.slice();
+          };
+          const deriveGapMedia = (tl, firstId) => {
+            let prev = null, lastA = null, firstB = null;
+            const advancing = (e) => {
+              if (!prev || !prev.media || !e.media) return false;
+              for (const cur of e.media) {
+                const p = prev.media.find(x => x.i === cur.i && x.src === cur.src);
+                if (p && !cur.paused && cur.ct - p.ct > 0.002) return true;
+              }
+              return false;
+            };
+            for (const e of tl) {
+              if (advancing(e)) {
+                if (e.itemId === firstId) lastA = e.t;
+                else if (e.itemId && lastA !== null && firstB === null) firstB = e.t;
+              }
+              prev = e;
+            }
+            return (lastA !== null && firstB !== null) ? +(firstB - lastA).toFixed(1) : null;
+          };
+          const distinctSrcs = (tl) => {
+            const s = new Set();
+            for (const e of tl) for (const mm of (e.media || [])) if (mm.src) s.add(mm.src);
+            return s.size;
+          };
+
+          const waitFor = (pred, ms) => new Promise(res => {
+            const iv = setInterval(() => { if (pred()) { clearInterval(iv); clearTimeout(to); res(true); } }, 40);
+            const to = setTimeout(() => { clearInterval(iv); res(false); }, ms);
+          });
+          const settle = async () => { try { await m().stop(); } catch (_) {} await new Promise(r => setTimeout(r, 800)); };
+          const playSafely = async () => {
+            try { await m().play(); } catch (e) {
+              // MusicKit refuses play() from several states; a stop first always
+              // makes it legal, and this is setup rather than measurement.
+              try { await m().stop(); await m().play(); } catch (e2) { throw e2; }
+            }
+          };
+          const seekNearEnd = () => {
+            const dur = (m().nowPlayingItem?.attributes?.durationInMillis ?? 0) / 1000;
+            if (dur > LEAD_S + 2) m().seekToTime(Math.max(0, dur - LEAD_S));
+          };
+
+          const IDS = {{.IDsJSON}};
+          const LEAD_S = {{.LeadSeconds}};
+          const TAIL_MS = {{.TailMs}};
+          const REPEATS = {{.Repeats}};
+          const sf = m().storefrontId || '{{.Storefront}}' || 'us';
+
+          let catalog = [];
+          try {
+            const r = await m().api.music(`/v1/catalog/${sf}/songs`, { ids: IDS, include: 'library' });
+            catalog = r?.data?.data ?? [];
+          } catch (e) { fail('resolve-catalog', e); flush(); return; }
+          if (catalog.length < 2) { fail('resolve-catalog', 'need >=2 catalog songs, got ' + catalog.length); flush(); return; }
+          RESULT.catalog = catalog.map(s => ({ id: s.id, name: s.attributes?.name,
+            libraryId: s.relationships?.library?.data?.[0]?.id ?? null }));
+
+          // The library copy of the SECOND track, so the mixed arm differs from
+          // the native-items arm in item kind only.
+          const libId = catalog[1]?.relationships?.library?.data?.[0]?.id ?? null;
+          let libObj = null;
+          if (libId) {
+            try {
+              const lr = await m().api.music(`/v1/me/library/songs/${libId}`);
+              libObj = lr?.data?.data?.[0] ?? null;
+            } catch (e) { fail('fetch-library-copy', e); }
+          }
+          RESULT.mixedSecondItemId = libObj ? libObj.id : null;
+
+          // One boundary where MusicKit owns the queue and advances itself.
+          const measureNative = async (descriptor) => {
+            await settle();
+            await m().setQueue(descriptor);
+            await playSafely();
+            if (!await waitFor(() => m().playbackState === 2, 25000)) return { error: 'never reached playing' };
+            const firstId = m().nowPlayingItem?.id ?? null;
+            startRecording();
+            seekNearEnd();
+            const advanced = await waitFor(() => (m().nowPlayingItem?.id ?? null) !== firstId, (LEAD_S + 25) * 1000);
+            await new Promise(r => setTimeout(r, TAIL_MS));
+            const tl = stopRecording();
+            return { gapMs: deriveGapMedia(tl, firstId), distinctMediaSrcs: distinctSrcs(tl),
+                     advanced, firstId, secondId: m().nowPlayingItem?.id ?? null };
+          };
+
+          // One boundary the way vibez does it today: a fresh one-item queue,
+          // built only once the previous track reports completed.
+          const measureRebuild = async (id0, id1) => {
+            await settle();
+            await m().setQueue({ songs: [id0] });
+            await playSafely();
+            if (!await waitFor(() => m().playbackState === 2, 25000)) return { error: 'never reached playing' };
+            const firstId = m().nowPlayingItem?.id ?? null;
+            startRecording();
+            seekNearEnd();
+            const completed = await waitFor(() => m().playbackState === COMPLETED, (LEAD_S + 25) * 1000);
+            // Exactly what _doPlayAt does on `completed`.
+            try {
+              await m().setQueue({ songs: [id1] });
+              await playSafely();
+            } catch (e) {
+              const tl = stopRecording();
+              return { error: errStr(e), distinctMediaSrcs: distinctSrcs(tl), completed };
+            }
+            const started = await waitFor(
+              () => (m().nowPlayingItem?.id ?? null) === id1 && m().playbackState === 2, 25000);
+            await new Promise(r => setTimeout(r, TAIL_MS));
+            const tl = stopRecording();
+            return { gapMs: deriveGapMedia(tl, firstId), distinctMediaSrcs: distinctSrcs(tl),
+                     advanced: completed && started, firstId, secondId: m().nowPlayingItem?.id ?? null };
+          };
+
+          // Every arm is exactly TWO items over the SAME pair of tracks, so the
+          // arms differ only in how the queue is expressed — not in length. An
+          // earlier run had the native arms at three items and the mixed arm at
+          // two, which left queue length free to explain the difference.
+          const pair = catalog.slice(0, 2);
+          const arms = [
+            { name: 'rebuild',       items: 2, run: () => measureRebuild(pair[0].id, pair[1].id) },
+            { name: 'native-songs',  items: 2, run: () => measureNative({ songs: pair.map(s => s.id) }) },
+            { name: 'native-items',  items: 2, run: () => measureNative({ items: pair }) },
+          ];
+          if (libObj) {
+            // Same second track as the arms above, but as the user's library
+            // copy. Item kind is then the only difference from native-items.
+            arms.push({ name: 'native-items-mixed', items: 2,
+                        run: () => measureNative({ items: [pair[0], libObj] }) });
+          }
+          RESULT.arms = arms.map(a => ({ name: a.name, itemCount: a.items }));
+
+          // Round-robin so drift between reps hits every arm equally, AND the
+          // order rotated each rep so no arm keeps a fixed position: running
+          // last means benefiting from whatever the earlier arms warmed.
+          for (let rep = 1; rep <= REPEATS; rep++) {
+            const off = (rep - 1) % arms.length;
+            const order = arms.slice(off).concat(arms.slice(0, off));
+            for (let pos = 0; pos < order.length; pos++) {
+              const arm = order[pos];
+              let out;
+              try { out = await arm.run(); }
+              catch (e) { out = { error: errStr(e) }; }
+              RESULT.samples.push(Object.assign({ arm: arm.name, rep, posInRep: pos + 1 }, out));
+            }
+          }
+
+          await settle();
+          flush();
+        } catch (e) {
+          fail('top', e);
+          flush();
+        }
+      });
+    </script>
+    <script src="https://js-cdn.music.apple.com/musickit/v3/musickit.js" data-web-components async></script>
+  </body>
+</html>
