@@ -49,10 +49,16 @@ func runWebKitFlow(cfg *config.Config, iconPath string, opts tui.Options, onUser
 
 	if cfg.AppleUserToken != "" {
 		fmt.Fprintln(os.Stderr, "Checking Apple Music session...")
-		if !auth.ValidateToken(cfg.AppleDeveloperToken, cfg.AppleUserToken) {
+		switch auth.CheckTokens(cfg.AppleDeveloperToken, cfg.AppleUserToken) {
+		case auth.UserTokenRejected:
 			fmt.Fprintln(os.Stderr, "Session expired - re-authenticating...")
 			cfg.AppleUserToken = ""
 			_ = cfg.Save("")
+		case auth.DeveloperTokenRejected:
+			// Re-authenticating cannot mint a working developer token, so keep
+			// the user token: it is still good once the build is.
+			fmt.Fprintln(os.Stderr, auth.DeveloperTokenHelp)
+		case auth.TokensValid:
 		}
 	}
 	if cfg.AppleUserToken == "" {

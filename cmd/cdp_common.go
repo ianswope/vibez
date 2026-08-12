@@ -45,10 +45,16 @@ func runCDPFlow(cfg *config.Config, opts tui.Options, onUserToken, onStorefront 
 
 		if cfg.AppleUserToken != "" {
 			prog.Send(tui.InitStatusMsg("Checking Apple Music session..."))
-			if !auth.ValidateToken(cfg.AppleDeveloperToken, cfg.AppleUserToken) {
+			switch auth.CheckTokens(cfg.AppleDeveloperToken, cfg.AppleUserToken) {
+			case auth.UserTokenRejected:
 				prog.Send(tui.InitStatusMsg("Session expired - re-authenticating..."))
 				cfg.AppleUserToken = ""
 				_ = cfg.Save("")
+			case auth.DeveloperTokenRejected:
+				// Re-authenticating cannot mint a working developer token, so
+				// keep the user token: it is still good once the build is.
+				prog.Send(tui.InitStatusMsg(auth.DeveloperTokenStatus))
+			case auth.TokensValid:
 			}
 		}
 
