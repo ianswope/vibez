@@ -90,18 +90,27 @@ case "${ARCH_RAW}" in
     *)               die "Unsupported architecture: ${ARCH_RAW}" ;;
 esac
 
-[ "${OS}" = "linux" ] || die "vibez currently supports Linux only (got: ${OS})"
-if [ "${ARCH}" = "arm64" ]; then
-    die "no prebuilt Linux/arm64 binary is published yet — build from source: git clone https://github.com/simonepelosi/vibez && cd vibez && make build (arm64 full-track playback needs a system Chromium + Widevine CDM installed)"
-elif [ "${ARCH}" != "amd64" ]; then
-    die "vibez ships amd64 binaries only (got: ${ARCH_RAW})"
-fi
+# Releases publish linux/amd64, darwin/amd64 and darwin/arm64 (.goreleaser.yml).
+case "${OS}" in
+    linux)
+        PLATFORM="Linux ${ARCH_RAW}"
+        [ "${ARCH}" = "amd64" ] || \
+            die "no prebuilt Linux/${ARCH} binary is published yet — build from source: git clone https://github.com/simonepelosi/vibez && cd vibez && make build (arm64 full-track playback needs a system Chromium + Widevine CDM installed)"
+        ;;
+    darwin)
+        PLATFORM="macOS ${ARCH_RAW}"
+        ;;
+    *)
+        die "vibez supports Linux and macOS (got: ${OS})"
+        ;;
+esac
 
 need_cmd tar
 need_cmd grep
 need_cmd sed
+need_cmd awk
 
-success "Linux ${ARCH_RAW}"
+success "${PLATFORM}"
 
 # ── resolve latest release ────────────────────────────────────────────────────
 
@@ -155,19 +164,29 @@ success "Download complete"
 
 step "Verifying checksum…"
 
-cd "${TMP}"
-if command -v sha256sum >/dev/null 2>&1; then
-    grep "${ARCHIVE}" checksums.txt | sha256sum --check --status \
-        || die "Checksum mismatch — the download may be corrupted. Please retry."
-elif command -v shasum >/dev/null 2>&1; then
-    grep "${ARCHIVE}" checksums.txt | shasum -a 256 --check --status \
-        || die "Checksum mismatch — the download may be corrupted. Please retry."
-else
-    warn "sha256sum not found — skipping checksum verification."
-fi
-cd - >/dev/null
+# checksums.txt lines are "<sha256>  <filename>", or "*<filename>" in binary mode.
+EXPECTED="$(awk -v f="${ARCHIVE}" '$2 == f || $2 == "*" f { print $1; exit }' "${TMP}/checksums.txt")"
 
-success "Checksum OK"
+# Digest the archive ourselves rather than piping into --check: macOS ships a BSD
+# sha256sum that wins `command -v` but only understands [-bctwz], so GNU-style
+# long options abort every mac install with a bogus mismatch. The bare
+# invocation prints "<sha256>  <path>" on GNU coreutils, BSD and shasum alike.
+ACTUAL=""
+if command -v sha256sum >/dev/null 2>&1; then
+    ACTUAL="$(sha256sum "${TMP}/${ARCHIVE}" | awk '{print $1}')"
+elif command -v shasum >/dev/null 2>&1; then
+    ACTUAL="$(shasum -a 256 "${TMP}/${ARCHIVE}" | awk '{print $1}')"
+fi
+
+if [ -z "${ACTUAL}" ]; then
+    warn "No sha256 tool found — skipping checksum verification."
+elif [ -z "${EXPECTED}" ]; then
+    die "No checksum published for ${ARCHIVE} — refusing to install."
+elif [ "${ACTUAL}" != "${EXPECTED}" ]; then
+    die "Checksum mismatch — the download may be corrupted. Please retry."
+else
+    success "Checksum OK"
+fi
 
 # ── install ───────────────────────────────────────────────────────────────────
 
@@ -180,28 +199,59 @@ chmod 755 "${INSTALL_DIR}/${BIN}"
 
 success "${INSTALL_DIR}/${BIN}"
 
-# ── desktop integration ───────────────────────────────────────────────────────
+# ── desktop integration (XDG, Linux only) ─────────────────────────────────────
 
-step "Installing desktop integration…"
+if [ "${OS}" = "linux" ]; then
+    step "Installing desktop integration…"
 
-RAW_BASE="https://raw.githubusercontent.com/${REPO}/main"
-APP_ID="io.github.simonepelosi.vibez"
+    RAW_BASE="https://raw.githubusercontent.com/${REPO}/main"
+    APP_ID="io.github.simonepelosi.vibez"
 
-DESKTOP_DIR="${HOME}/.local/share/applications"
-ICON_DIR="${HOME}/.local/share/icons/hicolor/512x512/apps"
+    DESKTOP_DIR="${HOME}/.local/share/applications"
+    ICON_DIR="${HOME}/.local/share/icons/hicolor/512x512/apps"
 
-mkdir -p "${DESKTOP_DIR}" "${ICON_DIR}"
+    mkdir -p "${DESKTOP_DIR}" "${ICON_DIR}"
 
-download "${RAW_BASE}/flatpak/${APP_ID}.desktop" "${DESKTOP_DIR}/${APP_ID}.desktop"
-download "${RAW_BASE}/assets/logo.png"            "${ICON_DIR}/${APP_ID}.png"
+    download "${RAW_BASE}/flatpak/${APP_ID}.desktop" "${DESKTOP_DIR}/${APP_ID}.desktop"
+    download "${RAW_BASE}/assets/logo.png"            "${ICON_DIR}/${APP_ID}.png"
 
-# Refresh desktop and icon caches so the DE picks up the new entries immediately.
-command -v update-desktop-database >/dev/null 2>&1 \
-    && update-desktop-database "${DESKTOP_DIR}" 2>/dev/null || true
-command -v gtk-update-icon-cache >/dev/null 2>&1 \
-    && gtk-update-icon-cache -f -t "${HOME}/.local/share/icons/hicolor" 2>/dev/null || true
+    # Refresh desktop and icon caches so the DE picks up the new entries immediately.
+    command -v update-desktop-database >/dev/null 2>&1 \
+        && update-desktop-database "${DESKTOP_DIR}" 2>/dev/null || true
+    command -v gtk-update-icon-cache >/dev/null 2>&1 \
+        && gtk-update-icon-cache -f -t "${HOME}/.local/share/icons/hicolor" 2>/dev/null || true
 
-success "Desktop file and icon installed"
+    success "Desktop file and icon installed"
+fi
+
+# ── Chrome check (macOS) ──────────────────────────────────────────────────────
+
+# vibez plays full tracks through an installed Google Chrome on macOS; it never
+# downloads one. Mirrors the lookup order in internal/player/cdp/browser_darwin.go
+# so the installer warns about exactly what the player would fail to find.
+if [ "${OS}" = "darwin" ]; then
+    step "Checking Google Chrome…"
+
+    CHROME=""
+    for candidate in \
+        "${VIBEZ_CHROME_PATH:-}" \
+        "${CHROME_PATH:-}" \
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
+        "${HOME}/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+    do
+        if [ -n "${candidate}" ] && [ -x "${candidate}" ]; then
+            CHROME="${candidate}"
+            break
+        fi
+    done
+
+    if [ -n "${CHROME}" ]; then
+        success "${CHROME}"
+    else
+        warn "Google Chrome not found — full-track playback needs it."
+        info "Install it with: brew install --cask google-chrome"
+    fi
+fi
 
 
 step "Checking PATH…"
