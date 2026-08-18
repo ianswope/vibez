@@ -89,3 +89,78 @@ never invoked again.
   Run `./vibez --local --music-dir <corpus>` and listen.
 - Interactive TUI behaviour: queue panel agreement, `:clear`, entry remove/move during
   playback, relative `--music-dir`.
+
+---
+
+## Results as of `9cd4c1d` (2026-08-18, M-series Apple Silicon, go1.26.1 darwin/arm64)
+
+Re-run of the same matrix against the current PR head, 15 commits on from `b306c6a`.
+The harness commit cherry-picked with no conflict; **the scaffolding commit was not
+needed and was dropped** — GurKalra's own code compiles now.
+
+Build — **both paths clean, no local edits**:
+
+| Check | Result |
+|---|---|
+| `CGO_ENABLED=1 go build ./...` | clean (was: `conflicting types for 'vibezOnEOS'`) |
+| `CGO_ENABLED=0 go build ./...` | clean (was: `LoadTracks`/`SetQueue`/`AppendQueue` undefined) |
+| `go vet ./...` | clean |
+| `go test ./...` | 17 packages ok, 0 failures |
+| `gofmt -l` | empty |
+
+Runtime, `b306c6a` → `9cd4c1d`:
+
+| Item | Then | Now |
+|---|---|---|
+| Seek mid-playback | dead permanently | **fixed** — pos advances 678ms → 2.786s, playing stays true |
+| Seek after EOS | dead | resumes, pos 1.4808s — but `Playing=false` while position moved (see below) |
+| Duration at 48kHz | 5.44217687s for a 5.000s file | **fixed** — 5s (divisor no longer hardcoded) |
+| Position accuracy | started at 557.278911ms, ran ~0.55s ahead | **fixed** — 1.478s at t=1.5s, ~22ms behind wall clock |
+| `SetQueue` id list | ignored beyond `ids[0]` | **fixed** — `SetQueue([C,B])` → len=2, plays TRACK-C |
+| Play after `ClearQueue` | queue unrecoverable | **fixed** — Clear+Set+Append → len=3, playing |
+| EOS auto-advance | works | works (TRACK-A → TRACK-B) |
+| mp3 / flac / m4a, `#` in filename | works | works |
+| `.ogg` | scanned, unplayable, skipped | **unchanged** — dur=0s, skipped after ~0.5–1.0s |
+| Repeat-off, single track | loops forever | **unchanged** — restarted 1×; `Next()` still wraps `% len(queue)` |
+| cgo.Handle / EOS race | not reproduced | **reproduced as a use-after-free SIGSEGV — see below** |
+| `pollState` stale position | stale vs Linux | not probe-covered this round |
+
+### New: `Close()` during an EOS-driven track change is a use-after-free
+
+`playTrack` releases `p.mu` and *then* calls `C.vibez_start(audio)` on a local copy of
+the pointer (`player_darwin.go:327`). `Close` takes `p.mu` and calls
+`C.vibez_destroy(p.audio)` on the same object (`player_darwin.go:594`). The mutex guards
+the *field*, not the in-flight C call, so a `Close` landing in that window frees the
+AudioQueue/ExtAudioFile out from under a running `vibez_start`. One crash dump has both
+frames on the same address: `_Cfunc_vibez_start(0x81b548140)` and
+`_Cfunc_vibez_destroy(0x81b548140)`.
+
+Reproduction rates, `TestProbeCloseOnTrackChange` (poll every 5ms, `Close()` the instant
+the change is observable — `pos=0s` in the state read is the marker for being inside the
+window):
+
+| Corpus | Rate |
+|---|---|
+| one.mp3 (5s) → two.flac (5s) | **4/4** |
+| short.mp3 (0.4s) → two.flac | 4/6 |
+| four.ogg → one.mp3 (`TestProbeOggNeverEnds`) | 5/5 |
+
+The ogg is **not** the cause — it only phase-locks the collision with that probe's 750ms
+poll, which is why it looked deterministic there. Two controls separate the race from
+state corruption: the same advance with no `Close()` survives (`TestProbeOggNoClose`), and
+a fixed-delay `Close()` landing *after* the window survives 10/10 at 300/600/900/1500/3000ms
+(`TestProbeCloseAfterOggAdvance`, `TestProbeCloseAtEOSStart`).
+
+In the app this is quit-during-auto-advance: press `q` as a track rolls over and the
+process can die in CoreAudio instead of exiting.
+
+### Observation, not yet a defect: EOS fires ~200ms early
+
+With a 5ms poll, the change off `one.mp3` (duration reported 5.041632653s) is visible at
+t≈4.845s — about 197ms before the audio should end. Probes run at volume 0, so whether the
+tail is actually truncated needs a human to listen.
+
+### Still needing a human
+
+Unchanged from the `b306c6a` run: is audio audible and correct, and does the interactive
+TUI agree (queue panel, `:clear`, remove/move during playback, relative `--music-dir`).
