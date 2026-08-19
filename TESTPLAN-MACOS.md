@@ -164,3 +164,46 @@ tail is actually truncated needs a human to listen.
 
 Unchanged from the `b306c6a` run: is audio audible and correct, and does the interactive
 TUI agree (queue panel, `:clear`, remove/move during playback, relative `--music-dir`).
+
+## Round 3: the windows `a34eae3` leaves open
+
+`a34eae3` adds an `audioWg sync.WaitGroup` that `Close` waits on before
+`vibez_destroy`. It closes the reported repro, because `eosLoop`'s only exit is the
+`<-p.done` case, so `Wait()` (`player_darwin.go:595`) cannot return while `eosLoop` is
+inside `playTrack`. The WaitGroup counts `eosLoop` and nothing else, so three windows
+onto the same free remain. `zz_probe6_darwin_test.go` covers them.
+
+Run each alone. The fault is unrecoverable and takes the process down, so a shared run
+cannot tell you which probe died.
+
+```sh
+export PROBE_MUSIC_DIR=./probe-corpus
+go test ./internal/player/local/ -run TestProbeCloseDuringManualNext   -v -count=1
+go test ./internal/player/local/ -run TestProbeClearQueueOnTrackChange -v -count=1
+go test ./internal/player/local/ -run TestProbeConcurrentPlayTrack     -v -count=1
+```
+
+| Probe | Window | Destroyer | Reached from |
+|---|---|---|---|
+| `TestProbeCloseDuringManualNext` | user `Next()` vs `Close()` | `Close` `:598` | `Next` `:395`, not `eosLoop` |
+| `TestProbeClearQueueOnTrackChange` | EOS advance vs `ClearQueue()` | `ClearQueue` `:558-559` | `eosLoop`, destroyer the WaitGroup ignores |
+| `TestProbeConcurrentPlayTrack` | `playTrack` vs `playTrack` | `playTrack` `:311` | two callers, no `Close` at all |
+
+The first is "press `n`, then `q`". The TUI puts those on different goroutines by
+construction: `n` dispatches `Next` through `playerCmd` (`internal/tui/model.go:2095`) as
+a `tea.Cmd`, which bubbletea runs off the event loop, while `Close` is called
+synchronously in `handleKey` (`:1162`) and `executeCommand` (`:1426`) on the event loop.
+
+Controls, matching round 2: `PROBE_NEXT_CLOSE_DELAY_MS` and `PROBE_CLEAR_DELAY_MS` push
+the call past the post-unlock window, and a surviving delayed run separates a race from
+state corruption. `PROBE_PLAYTRACK_ROUNDS` sets the concurrent-`playTrack` iteration
+count (default 40).
+
+### Corpus fix
+
+`gen-probe-corpus.sh` generated six 5.000s files and no `short.mp3`, which
+`TestProbeCloseAtEOSStart` and `TestProbeCloseOnTrackChange` both default to. On a freshly
+generated corpus those two opened a missing file, so they reported "survived" without ever
+reaching the window. The generator now also writes `short.mp3` at 0.4s, verified at
+exactly 0.400000s. `TestProbeClearQueueOnTrackChange` defaults to `one.mp3` and
+`two.flac`, the pair that reproduced 4/4 on `9cd4c1d`.
