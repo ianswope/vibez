@@ -2,8 +2,9 @@
 # Generate the audio corpus used by the CoreAudio probes in
 # internal/player/local/zz_probe*_darwin_test.go.
 #
-# Deliberately not committed as binaries: six generated sine files, all exactly
-# 5.000s, each a distinct pitch so you can tell by ear which track is playing.
+# Deliberately not committed as binaries: seven generated sine files, each a
+# distinct pitch so you can tell by ear which track is playing. Six are exactly
+# 5.000s; short.mp3 is 0.4s so the EOS boundary arrives quickly.
 #
 # Usage: scripts/gen-probe-corpus.sh [outdir]     (default: ./probe-corpus)
 # Requires: ffmpeg
@@ -27,6 +28,8 @@ gen four.ogg       880 "Four Eight Eighty" "Test Artist D"
 gen 'five#hash.mp3' 330 "Five Hash"        "Test Artist E"
 # 48kHz on purpose: exposes the hardcoded-44100 divisor in duration/position/seek.
 gen six_48k.flac   740 "Six 48k"           "Test Artist F" -ar 48000
+# 0.4s on purpose: the Close/EOS probes need a boundary that arrives quickly.
+gen short.mp3      494 "Short Four Ninety"  "Test Artist G" -t 0.4
 
 echo "corpus written to $out"
 ls -1 "$out"
