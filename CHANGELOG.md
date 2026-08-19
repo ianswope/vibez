@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Discovery mode returned nothing when amp-api rejected the token**: catalog song search goes through `amp-api.music.apple.com`, an undocumented web-player endpoint that can reject a developer/user token pair the supported endpoints accept. The songs leg then came back empty while the library and album/playlist legs succeeded, leaving discovery with nothing to refill from. That leg now retries against Apple's supported `/catalog/{storefront}/search` endpoint. The fallback response carries no `extendedAssetUrls`, so the stream-availability filter is applied only to amp-api results, and playback stays the final authority on storefront availability. Refs #93.
+
 ## [0.6.0] — 2026-08-20
 
 ### Added
