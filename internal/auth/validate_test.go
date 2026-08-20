@@ -91,6 +91,25 @@ func TestCheckTokens_InconclusiveTiebreakerKeepsSession(t *testing.T) {
 	}
 }
 
+// A tiebreaker that fails for reasons of Apple's own must not be read as proof
+// the developer token is good, because that attributes the rejection to the
+// user token and clears a session that was never the problem.
+func TestCheckTokens_ServerErrorTiebreakerKeepsSession(t *testing.T) {
+	for _, code := range []int{
+		http.StatusTooManyRequests,
+		http.StatusInternalServerError,
+		http.StatusBadGateway,
+		http.StatusServiceUnavailable,
+	} {
+		user, _ := statusServer(t, http.StatusUnauthorized)
+		dev, _ := statusServer(t, code)
+
+		if got := checkTokens(user.URL, dev.URL, "dev", "user"); got != TokensValid {
+			t.Errorf("tiebreaker %d: checkTokens = %v, want TokensValid", code, got)
+		}
+	}
+}
+
 func TestCheckTokens_SendsBothCredentials(t *testing.T) {
 	user, userHeaders := statusServer(t, http.StatusOK)
 	dev, _ := statusServer(t, http.StatusOK)

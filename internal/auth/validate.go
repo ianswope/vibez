@@ -84,8 +84,9 @@ type probeResult int
 const (
 	probeAccepted probeResult = iota
 	probeRejected
-	// probeInconclusive covers network failures, where assuming the worst
-	// would force an unnecessary re-login.
+	// probeInconclusive covers network failures and any response that is
+	// neither a clear acceptance nor a clear rejection, where assuming the
+	// worst would force an unnecessary re-login.
 	probeInconclusive
 )
 
@@ -113,5 +114,11 @@ func probe(url, devToken, userToken string) probeResult {
 	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
 		return probeRejected
 	}
-	return probeAccepted
+	// Only a 2xx proves the credentials were accepted. A 429 or a 5xx says
+	// nothing about them, and treating it as acceptance would let a transient
+	// Apple outage attribute the rejection to the user token and wipe it.
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		return probeAccepted
+	}
+	return probeInconclusive
 }
