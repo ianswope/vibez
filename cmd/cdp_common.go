@@ -43,6 +43,7 @@ func runCDPFlow(cfg *config.Config, opts tui.Options, onUserToken, onStorefront 
 			return
 		}
 
+		devTokenRejected := false
 		if cfg.AppleUserToken != "" {
 			prog.Send(tui.InitStatusMsg("Checking Apple Music session..."))
 			switch auth.CheckTokens(cfg.AppleDeveloperToken, cfg.AppleUserToken) {
@@ -53,16 +54,21 @@ func runCDPFlow(cfg *config.Config, opts tui.Options, onUserToken, onStorefront 
 			case auth.DeveloperTokenRejected:
 				// Re-authenticating cannot mint a working developer token, so
 				// keep the user token: it is still good once the build is.
+				devTokenRejected = true
 				prog.Send(tui.InitStatusMsg(auth.DeveloperTokenStatus))
 			case auth.TokensValid:
 			}
 		}
 
-		status := hooks.initStatus
-		if status == "" {
-			status = "Initializing vibez..."
+		// The generic progress line would replace the warning above before it
+		// could be read, and it carries less information than the warning does.
+		if !devTokenRejected {
+			status := hooks.initStatus
+			if status == "" {
+				status = "Initializing vibez..."
+			}
+			prog.Send(tui.InitStatusMsg(status))
 		}
-		prog.Send(tui.InitStatusMsg(status))
 		if err := cdp.EnsureBrowser(func(msg string) {
 			prog.Send(tui.InitStatusMsg(msg))
 		}); err != nil {
