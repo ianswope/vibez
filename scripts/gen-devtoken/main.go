@@ -3,8 +3,7 @@
 // signed token to stdout so CI can capture and inject it at build time.
 //
 // With -write it instead writes the token into apple_developer_token in the
-// vibez config file, which is handy for local (non-embedded) builds where the
-// token expires every 30 days.
+// vibez config file, which is handy for local (non-embedded) builds.
 //
 // Required env vars:
 //
@@ -57,7 +56,17 @@ func main() {
 	fmt.Fprintf(os.Stderr, "wrote developer token to %s\n", path)
 }
 
-// generateToken signs an Apple Music developer JWT valid for 30 days.
+// tokenTTL is how long a generated developer token stays valid.
+//
+// Apple caps MusicKit developer tokens at six months, 15777000 seconds, and
+// rejects anything longer at token-exchange time. Releases embed the token at
+// build time, so a short TTL means a binary stops reaching the catalog long
+// before it stops being the newest release: the ceiling is the useful value
+// here. A rejected token is no longer destructive to the user's session, and
+// vibez tells them the build is stale rather than clearing their login.
+const tokenTTL = 15777000 * time.Second
+
+// generateToken signs an Apple Music developer JWT valid for tokenTTL.
 func generateToken(keyID, teamID, privateKeyPEM string) (string, error) {
 	ecKey, err := parsePrivateKey(privateKeyPEM)
 	if err != nil {
@@ -71,7 +80,7 @@ func generateToken(keyID, teamID, privateKeyPEM string) (string, error) {
 	token.Claims = jwt.MapClaims{
 		"iss": teamID,
 		"iat": now.Unix(),
-		"exp": now.Add(30 * 24 * time.Hour).Unix(),
+		"exp": now.Add(tokenTTL).Unix(),
 	}
 
 	signed, err := token.SignedString(ecKey)

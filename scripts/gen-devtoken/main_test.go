@@ -90,7 +90,7 @@ func TestGeneratedTokenClaims(t *testing.T) {
 	tok.Claims = jwt.MapClaims{
 		"iss": "TEAMID1234",
 		"iat": now.Unix(),
-		"exp": now.Add(30 * 24 * time.Hour).Unix(),
+		"exp": now.Add(tokenTTL).Unix(),
 	}
 
 	signed, err := tok.SignedString(key)
@@ -155,6 +155,50 @@ func TestGenerateToken_InvalidKey(t *testing.T) {
 	}
 }
 
+// generateToken is the only thing that sets the real expiry, and nothing
+// exercised it before: the fixtures above rebuild the claims by hand. Apple
+// rejects a developer token whose lifetime exceeds six months, so a value that
+// drifts past the ceiling fails at token-exchange time rather than at build
+// time, where it would be caught.
+func TestGenerateTokenExpiry(t *testing.T) {
+	const appleMaxTTL = 15777000 * time.Second
+
+	if tokenTTL > appleMaxTTL {
+		t.Fatalf("tokenTTL = %v, exceeds Apple's %v ceiling", tokenTTL, appleMaxTTL)
+	}
+
+	_, pemStr := generateTestKey(t)
+
+	before := time.Now()
+	signed, err := generateToken("TESTKEY123", "TEAMID1234", pemStr)
+	if err != nil {
+		t.Fatalf("generateToken: %v", err)
+	}
+	after := time.Now()
+
+	parsed, _, err := jwt.NewParser().ParseUnverified(signed, jwt.MapClaims{})
+	if err != nil {
+		t.Fatalf("parsing generated token: %v", err)
+	}
+	claims, ok := parsed.Claims.(jwt.MapClaims)
+	if !ok {
+		t.Fatal("unexpected claims type")
+	}
+
+	expF, ok := claims["exp"].(float64)
+	if !ok {
+		t.Fatalf("exp claim = %T, want a number", claims["exp"])
+	}
+	exp := time.Unix(int64(expF), 0)
+
+	// The token is signed somewhere inside [before, after], so the expiry must
+	// land in that same window shifted by tokenTTL.
+	lo, hi := before.Add(tokenTTL).Add(-time.Second), after.Add(tokenTTL).Add(time.Second)
+	if exp.Before(lo) || exp.After(hi) {
+		t.Errorf("exp = %v, want within [%v, %v]", exp, lo, hi)
+	}
+}
+
 func TestTokenHasCorrectHeader(t *testing.T) {
 	key, _ := generateTestKey(t)
 
@@ -163,7 +207,7 @@ func TestTokenHasCorrectHeader(t *testing.T) {
 	tok.Claims = jwt.MapClaims{
 		"iss": "TEAMTEST",
 		"iat": time.Now().Unix(),
-		"exp": time.Now().Add(30 * 24 * time.Hour).Unix(),
+		"exp": time.Now().Add(tokenTTL).Unix(),
 	}
 
 	signed, err := tok.SignedString(key)
