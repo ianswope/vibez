@@ -116,7 +116,7 @@ Full tracks stream via Chrome with Widevine DRM. On Linux amd64, Chrome is auto-
 
 ## Installation
 
-### One-liner (recommended, Linux)
+### One-liner (recommended)
 
 ```sh
 curl --proto '=https' --tlsv1.2 -sSf \
@@ -125,6 +125,9 @@ curl --proto '=https' --tlsv1.2 -sSf \
 
 Installs the latest release binary to `~/.local/bin/` and updates your shell profile if needed.
 You can also inspect the script before running it — that's always a good idea.
+
+Covers Linux x86-64 and macOS (Apple Silicon and Intel). Linux/arm64 has no published
+binary yet — build [from source](#from-source) instead.
 
 > **Update:** re-running the same command updates vibez to the latest release.
 

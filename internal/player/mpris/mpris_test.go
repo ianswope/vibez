@@ -252,6 +252,11 @@ func TestParseMetadataMap_WrongTypeNocrash(t *testing.T) {
 
 // fakeMPRIS registers a minimal MPRIS2 object on the session bus.
 // It records method calls and returns configurable property values.
+//
+// Everything under mu is served to the bus by godbus's inbound worker goroutine
+// as soon as the object is exported, so tests must not assign these fields
+// directly.  Set the initial values through the options below, which run before
+// the export, and let the D-Bus method handlers do the rest under the lock.
 type fakeMPRIS struct {
 	mu             sync.Mutex
 	calls          []string
@@ -263,9 +268,28 @@ type fakeMPRIS struct {
 	busName        string
 }
 
+// fakeOption seeds a fakeMPRIS field before the object goes live on the bus.
+type fakeOption func(*fakeMPRIS)
+
+func withPlaybackStatus(status string) fakeOption {
+	return func(f *fakeMPRIS) { f.playbackStatus = status }
+}
+
+func withVolume(volume float64) fakeOption {
+	return func(f *fakeMPRIS) { f.volume = volume }
+}
+
+func withPosition(posUs int64) fakeOption {
+	return func(f *fakeMPRIS) { f.posUs = posUs }
+}
+
+func withMetadata(metadata map[string]dbus.Variant) fakeOption {
+	return func(f *fakeMPRIS) { f.metadata = metadata }
+}
+
 // newFakeMPRIS registers a fake MPRIS service on the session bus and returns it.
 // If a bus session is unavailable the second return value is false.
-func newFakeMPRIS(t *testing.T) (*fakeMPRIS, bool) {
+func newFakeMPRIS(t *testing.T, opts ...fakeOption) (*fakeMPRIS, bool) {
 	t.Helper()
 	conn, err := dbus.ConnectSessionBus()
 	if err != nil {
@@ -288,8 +312,11 @@ func newFakeMPRIS(t *testing.T) (*fakeMPRIS, bool) {
 			"mpris:trackid": dbus.MakeVariant(dbus.ObjectPath("/org/mpris/MediaPlayer2/TrackList/NoTrack")),
 		},
 	}
+	for _, opt := range opts {
+		opt(f)
+	}
 
-	// Export root and player objects.
+	// Export root and player objects.  The object serves Get from here on.
 	if err := conn.Export(f, "/org/mpris/MediaPlayer2", "org.mpris.MediaPlayer2"); err != nil {
 		t.Fatal("Export org.mpris.MediaPlayer2:", err)
 	}
@@ -615,13 +642,14 @@ func TestMPRISPlayer_Close(t *testing.T) {
 }
 
 func TestMPRISPlayer_ReadState_Success(t *testing.T) {
-	fake, ok := newFakeMPRIS(t)
+	fake, ok := newFakeMPRIS(t,
+		withPlaybackStatus("Playing"),
+		withVolume(0.9),
+		withPosition(30_000_000), // 30 seconds
+	)
 	if !ok {
 		t.Skip("D-Bus session bus unavailable")
 	}
-	fake.playbackStatus = "Playing"
-	fake.volume = 0.9
-	fake.posUs = 30_000_000 // 30 seconds
 
 	p, conn := connectToFake(t, fake.busName)
 	defer conn.Close() //nolint:errcheck
@@ -639,14 +667,13 @@ func TestMPRISPlayer_ReadState_Success(t *testing.T) {
 }
 
 func TestMPRISPlayer_ReadState_WithMetadata(t *testing.T) {
-	fake, ok := newFakeMPRIS(t)
-	if !ok {
-		t.Skip("D-Bus session bus unavailable")
-	}
-	fake.metadata = map[string]dbus.Variant{
+	fake, ok := newFakeMPRIS(t, withMetadata(map[string]dbus.Variant{
 		"xesam:title":  dbus.MakeVariant("Test Song"),
 		"xesam:artist": dbus.MakeVariant([]string{"Test Artist"}),
 		"xesam:album":  dbus.MakeVariant("Test Album"),
+	}))
+	if !ok {
+		t.Skip("D-Bus session bus unavailable")
 	}
 
 	p, conn := connectToFake(t, fake.busName)
