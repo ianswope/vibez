@@ -177,7 +177,7 @@ Run each alone. The fault is unrecoverable and takes the process down, so a shar
 cannot tell you which probe died.
 
 ```sh
-export PROBE_MUSIC_DIR=./probe-corpus
+export PROBE_MUSIC_DIR="$PWD/probe-corpus"   # must be absolute, see below
 go test ./internal/player/local/ -run TestProbeCloseDuringManualNext   -v -count=1
 go test ./internal/player/local/ -run TestProbeClearQueueOnTrackChange -v -count=1
 go test ./internal/player/local/ -run TestProbeConcurrentPlayTrack     -v -count=1
@@ -198,6 +198,26 @@ Controls, matching round 2: `PROBE_NEXT_CLOSE_DELAY_MS` and `PROBE_CLEAR_DELAY_M
 the call past the post-unlock window, and a surviving delayed run separates a race from
 state corruption. `PROBE_PLAYTRACK_ROUNDS` sets the concurrent-`playTrack` iteration
 count (default 40).
+
+`PROBE_PLAYTRACK_ROUNDS` is **not** a control for window 3. Every round launches
+`PROBE_PLAYTRACK_GOROUTINES` concurrent `Next()` calls (default 2), so `ROUNDS=1` still
+races two of them and still dies. `PROBE_PLAYTRACK_GOROUTINES=1` is the control: same
+total call count, no concurrency.
+
+### Absolute corpus path
+
+`PROBE_MUSIC_DIR` must be absolute. `go test` runs each test binary in its own package
+directory, so a relative `./probe-corpus` resolves against `internal/player/local/` rather
+than the repo root. The old failure was silent, and it disarmed every probe in the suite:
+track IDs pointed at nothing, `LoadTracks` produced an empty queue, `SetPlaylist` returned
+`nil` at its `len(p.queue)==0` guard (`player_darwin.go:473`), and each `title != "A"`
+guard then fired at t≈6ms against `track="" playing=false`, reporting "survived" without
+reaching the window. The tell in a log is `pos=0s` next to an empty title.
+
+`musicDir` now resolves the path, refuses a directory it cannot read, and `mustPlay` /
+`mustStartPlaying` fail any probe whose playback never started. Round 1 and 2 used the
+absolute `/tmp/probe-corpus` above, so their published numbers are unaffected; only the
+round-3 snippet was wrong.
 
 ### Corpus fix
 
