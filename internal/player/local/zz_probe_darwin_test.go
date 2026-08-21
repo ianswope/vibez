@@ -14,12 +14,68 @@ import (
 	"github.com/simone-vibes/vibez/internal/provider"
 )
 
+// musicDir resolves the corpus directory and refuses one it cannot read.
+//
+// PROBE_MUSIC_DIR must be absolute, because `go test` runs each test binary in
+// its own package directory: a relative ./probe-corpus resolves against
+// internal/player/local/, not the repo root. The old failure was silent rather
+// than loud. Track IDs became paths to nothing, LoadTracks yielded an empty
+// queue, SetPlaylist returned nil at its len(p.queue)==0 guard
+// (player_darwin.go:473), and every `title != "A"` guard then fired at t~=6ms
+// against track="" playing=false -- so a probe reported "survived" without ever
+// reaching the window it exists to test.
 func musicDir(t *testing.T) string {
 	d := os.Getenv("PROBE_MUSIC_DIR")
 	if d == "" {
 		t.Skip("PROBE_MUSIC_DIR not set")
 	}
-	return d
+	abs, err := filepath.Abs(d)
+	if err != nil {
+		t.Fatalf("PROBE_MUSIC_DIR=%q: %v", d, err)
+	}
+	if fi, err := os.Stat(abs); err != nil || !fi.IsDir() {
+		t.Fatalf("PROBE_MUSIC_DIR=%q resolved to %q, which is not a readable directory: %v", d, abs, err)
+	}
+	if abs != d {
+		t.Logf("PROBE_MUSIC_DIR=%q resolved to %q (track IDs must be absolute)", d, abs)
+	}
+	return abs
+}
+
+// mustPlay fails the test unless want is playing within 2s. Every probe that
+// races something against an in-flight track needs this: without it a probe
+// whose playback never started still satisfies a `title != want` guard and
+// reports a false survival.
+func mustPlay(t *testing.T, p *Player, want string) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if title, _, _, playing := state(t, p); title == want && playing {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	title, pos, _, playing := state(t, p)
+	t.Fatalf("track %q never started (track=%q pos=%v playing=%v): the probe would not have reached its window",
+		want, title, pos, playing)
+}
+
+// mustStartPlaying is mustPlay for probes whose first track is short enough to
+// finish before an assertion on its title can land (short.mp3 is 0.4s). It only
+// requires that playback started at all, which is what the false-survival bug
+// turned on.
+func mustStartPlaying(t *testing.T, p *Player) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if title, _, _, playing := state(t, p); title != "" && playing {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	title, pos, _, playing := state(t, p)
+	t.Fatalf("playback never started (track=%q pos=%v playing=%v): the probe would not have reached its window",
+		title, pos, playing)
 }
 
 func track(dir, name, title string) provider.Track {

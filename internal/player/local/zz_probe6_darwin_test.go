@@ -52,6 +52,7 @@ func TestProbeCloseDuringManualNext(t *testing.T) {
 	})
 	_ = p.SetPlaylist("", 0)
 	_ = p.SetVolume(0)
+	mustPlay(t, p, "A")                // without this a dead corpus path reports a false survival
 	time.Sleep(500 * time.Millisecond) // let A settle so the change is unambiguous
 
 	go func() { _ = p.Next() }() // the tea.Cmd goroutine
@@ -100,6 +101,7 @@ func TestProbeClearQueueOnTrackChange(t *testing.T) {
 	defer func() { _ = p.Close() }()
 	_ = p.SetPlaylist("", 0)
 	_ = p.SetVolume(0)
+	mustPlay(t, p, "A")
 
 	start := time.Now()
 	for time.Since(start) < 12*time.Second {
@@ -130,6 +132,12 @@ func TestProbeClearQueueOnTrackChange(t *testing.T) {
 //
 // RepeatModeOne makes every Next() reach playTrack (:380) without depending on
 // queue position. PROBE_PLAYTRACK_ROUNDS sets the iteration count.
+//
+// PROBE_PLAYTRACK_GOROUTINES is the control, and it is the only one that works
+// here: every round launches this many concurrent Next() calls, so ROUNDS=1
+// still races two of them. Set it to 1 for the same total call count with no
+// concurrency, which separates "concurrency causes this" from "Next() is broken
+// on its own".
 func TestProbeConcurrentPlayTrack(t *testing.T) {
 	dir := musicDir(t)
 
@@ -141,6 +149,17 @@ func TestProbeConcurrentPlayTrack(t *testing.T) {
 		}
 		rounds = n
 	}
+	goroutines := 2
+	if v := os.Getenv("PROBE_PLAYTRACK_GOROUTINES"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			t.Fatalf("PROBE_PLAYTRACK_GOROUTINES=%q: %v", v, err)
+		}
+		if n < 1 {
+			t.Fatalf("PROBE_PLAYTRACK_GOROUTINES=%d: want >= 1", n)
+		}
+		goroutines = n
+	}
 
 	p := newQuiet(t, []provider.Track{
 		track(dir, "one.mp3", "A"),
@@ -150,13 +169,14 @@ func TestProbeConcurrentPlayTrack(t *testing.T) {
 	_ = p.SetPlaylist("", 0)
 	_ = p.SetVolume(0)
 	_ = p.SetRepeat(player.RepeatModeOne)
+	mustPlay(t, p, "A")
 	time.Sleep(300 * time.Millisecond)
 
 	for i := 0; i < rounds; i++ {
 		gate := make(chan struct{})
 		var wg sync.WaitGroup
-		wg.Add(2)
-		for g := 0; g < 2; g++ {
+		wg.Add(goroutines)
+		for g := 0; g < goroutines; g++ {
 			go func() {
 				defer wg.Done()
 				<-gate // release both as close together as the runtime allows
@@ -171,5 +191,6 @@ func TestProbeConcurrentPlayTrack(t *testing.T) {
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	t.Logf("RESULT: survived %d rounds of concurrent playTrack", rounds)
+	t.Logf("RESULT: survived %d rounds of %d-goroutine playTrack (%d Next calls)",
+		rounds, goroutines, rounds*goroutines)
 }
