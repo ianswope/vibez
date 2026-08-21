@@ -107,6 +107,7 @@ func TestProbeCloseOnTrackChange(t *testing.T) {
 	p := newQuiet(t, []provider.Track{track(dir, first, "A"), track(dir, second, "B")})
 	_ = p.SetPlaylist("", 0)
 	_ = p.SetVolume(0)
+	mustStartPlaying(t, p)
 
 	start := time.Now()
 	for time.Since(start) < 12*time.Second {
