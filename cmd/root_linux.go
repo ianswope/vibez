@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"syscall"
 	"time"
 
 	tea "charm.land/bubbletea/v2"
@@ -16,6 +17,8 @@ import (
 	"github.com/simone-vibes/vibez/internal/player/webkit"
 	"github.com/simone-vibes/vibez/internal/provider/apple"
 	"github.com/simone-vibes/vibez/internal/tui"
+	"github.com/simone-vibes/vibez/internal/updater"
+	"github.com/simone-vibes/vibez/internal/version"
 )
 
 func runPlatform(cfg *config.Config, iconPath string, opts tui.Options, onUserToken, onStorefront func(string), audioBitrateKbps int) error {
@@ -56,8 +59,21 @@ func runWebKitFlow(cfg *config.Config, iconPath string, opts tui.Options, onUser
 			_ = cfg.Save("")
 		case auth.DeveloperTokenRejected:
 			// Re-authenticating cannot mint a working developer token, so keep
-			// the user token: it is still good once the build is.
+			// the user token: it is still good once the build is. This path
+			// runs no update check of its own, so without asking here a stale
+			// build has no way to fix itself.
+			res := updater.UpdateNow(version.Version, noUpdate, func(msg string) {
+				fmt.Fprintln(os.Stderr, msg)
+			})
+			if res.Outcome == updater.OutcomeInstalled {
+				// Nothing owns the terminal or the main thread yet on this
+				// path, so the new binary can take over directly.
+				return syscall.Exec(res.Exe, os.Args, os.Environ()) //nolint:gosec // exe is the binary we just verified and installed
+			}
 			fmt.Fprintln(os.Stderr, auth.DeveloperTokenHelp)
+			if advice := res.Advice(); advice != "" {
+				fmt.Fprintln(os.Stderr, advice)
+			}
 		case auth.TokensValid:
 		}
 	}

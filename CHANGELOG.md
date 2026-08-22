@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **A rejected developer token now acts on the update instead of only naming it** — the startup update check looks at most once every 24 hours, so a build whose embedded token had just expired could print `Developer token rejected - update vibez to continue` on the same run that skipped the check which would have fixed it. That path now asks GitHub immediately, installs and restarts when a newer release exists, and otherwise says which case it is: nothing newer published yet, `--no-update` in force, or an install that cannot replace itself. The WebKit fallback path, which ran no update check at all, gets the same handling. Refs #108, #113.
+
 ## [0.6.1] — 2026-08-21
 
 ### Fixed

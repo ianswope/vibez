@@ -37,6 +37,58 @@ type ghAsset struct {
 	BrowserDownloadURL string `json:"browser_download_url"`
 }
 
+// Outcome says what an update attempt did.
+type Outcome int
+
+const (
+	// OutcomeFailed means the check itself did not complete, so nothing is
+	// known about whether a newer release exists.
+	OutcomeFailed Outcome = iota
+	// OutcomeCurrent means this build is already the newest release.
+	OutcomeCurrent
+	// OutcomeInstalled means a newer release was installed and the caller
+	// should re-exec Exe.
+	OutcomeInstalled
+	// OutcomeDisabled means a newer release exists and was left alone because
+	// updates were turned off.
+	OutcomeDisabled
+	// OutcomeManual means a newer release exists but this process did not
+	// install it: no asset for the platform, a binary it cannot replace, or a
+	// download that failed. Either way the user has to update it themselves.
+	OutcomeManual
+)
+
+// Result reports what an update attempt did, so a caller that knows the build
+// is broken can explain the situation rather than repeating "update vibez".
+type Result struct {
+	Outcome Outcome
+	// Tag is the newer release, when the check got far enough to learn it.
+	Tag string
+	// Exe is the binary to re-exec, set only for OutcomeInstalled.
+	Exe string
+}
+
+// Advice is a one-clause summary of what can be done about the update state.
+// It is empty when the check failed, since nothing is known to advise on.
+func (r Result) Advice() string {
+	switch r.Outcome {
+	case OutcomeCurrent:
+		return "this is already the newest release, so a newer build has to be published first"
+	case OutcomeInstalled:
+		return fmt.Sprintf("updated to %s", r.Tag)
+	case OutcomeDisabled:
+		return fmt.Sprintf("%s is available; restart without --no-update to install it", r.Tag)
+	case OutcomeManual:
+		return fmt.Sprintf("%s is available, but this install cannot replace itself; reinstall to update", r.Tag)
+	default:
+		return ""
+	}
+}
+
+// executable is indirected so tests can point the self-replace at a temp file
+// instead of the test binary.
+var executable = os.Executable
+
 // CheckAndUpdate checks GitHub for a newer release. If one is found it
 // downloads, verifies the SHA-256 checksum, and installs it in-place.
 // It returns the path of the updated binary when a restart is needed, or ""
@@ -45,6 +97,9 @@ type ghAsset struct {
 // The caller is responsible for re-execing after cleaning up (e.g. after the
 // TUI exits). All errors are handled internally — the function never blocks
 // startup fatally.
+//
+// It looks at most once every 24 hours. UpdateNow is for callers that cannot
+// wait for the next window.
 func CheckAndUpdate(current string, noUpdate bool, log func(string)) string {
 	if noUpdate {
 		return ""
@@ -52,19 +107,39 @@ func CheckAndUpdate(current string, noUpdate bool, log func(string)) string {
 	if !shouldCheck() {
 		return ""
 	}
+	return update(apiURL, current, true, log).Exe
+}
 
+// UpdateNow asks GitHub straight away, ignoring the once-a-day window, and
+// reports what it found. It is for callers that already know this build cannot
+// work: a rejected developer token is not something the user can wait out, and
+// the throttle would otherwise leave them on a broken build for another day.
+//
+// With noUpdate set it still reports whether a newer release exists, and
+// installs nothing.
+func UpdateNow(current string, noUpdate bool, log func(string)) Result {
+	return update(apiURL, current, !noUpdate, log)
+}
+
+// update is the testable core. api is the releases endpoint, and install says
+// whether a newer release may replace this binary.
+func update(api, current string, install bool, log func(string)) Result {
 	log("Checking for updates…")
 
-	rel, err := fetchLatestRelease()
+	rel, err := fetchLatestRelease(api)
 	if err != nil {
-		return ""
+		return Result{Outcome: OutcomeFailed}
 	}
 
 	markChecked()
 
 	if !isNewer(rel.TagName, current) {
-		return ""
+		return Result{Outcome: OutcomeCurrent, Tag: rel.TagName}
 	}
+
+	// Anything past here has a newer release to report, and reaching the end
+	// is the only way to come back with something better than OutcomeManual.
+	res := Result{Outcome: OutcomeManual, Tag: rel.TagName}
 
 	assetName := fmt.Sprintf("vibez_%s_%s.tar.gz", runtime.GOOS, runtime.GOARCH)
 	var downloadURL, checksumURL string
@@ -76,41 +151,48 @@ func CheckAndUpdate(current string, noUpdate bool, log func(string)) string {
 			checksumURL = a.BrowserDownloadURL
 		}
 	}
+	// Checked before install, so a platform with no published asset - today,
+	// linux/arm64 - is never told to drop --no-update for a build that is not
+	// there.
 	if downloadURL == "" {
-		return "" // no asset for this platform
+		return res
+	}
+	if !install {
+		res.Outcome = OutcomeDisabled
+		return res
 	}
 
 	// Only attempt self-update for writable, self-managed installs.
-	exe, err := os.Executable()
+	exe, err := executable()
 	if err != nil {
-		return ""
+		return res
 	}
 	exe, err = filepath.EvalSymlinks(exe)
 	if err != nil {
-		return ""
+		return res
 	}
 	if !isWritable(exe) {
-		return ""
+		return res
 	}
 
 	log(fmt.Sprintf("Downloading update %s…", rel.TagName))
 
 	tmpDir, err := os.MkdirTemp("", "vibez-update-*")
 	if err != nil {
-		return ""
+		return res
 	}
 
 	tarPath := filepath.Join(tmpDir, assetName)
 	if err := downloadFile(downloadURL, tarPath); err != nil {
 		_ = os.RemoveAll(tmpDir)
-		return ""
+		return res
 	}
 
 	if checksumURL != "" {
 		if err := verifyChecksum(tarPath, assetName, checksumURL); err != nil {
 			log("Update aborted: checksum verification failed")
 			_ = os.RemoveAll(tmpDir)
-			return ""
+			return res
 		}
 	}
 
@@ -119,11 +201,11 @@ func CheckAndUpdate(current string, noUpdate bool, log func(string)) string {
 	newBin := filepath.Join(tmpDir, "vibez")
 	if err := extractBinary(tarPath, "vibez", newBin); err != nil {
 		_ = os.RemoveAll(tmpDir)
-		return ""
+		return res
 	}
 	if err := os.Chmod(newBin, 0o755); err != nil { //nolint:gosec // executables require 0755
 		_ = os.RemoveAll(tmpDir)
-		return ""
+		return res
 	}
 
 	// Atomic replace: write to exe.new, rename over exe.
@@ -131,26 +213,26 @@ func CheckAndUpdate(current string, noUpdate bool, log func(string)) string {
 	data, err := os.ReadFile(newBin) //nolint:gosec // path comes from our own tmpDir
 	if err != nil {
 		_ = os.RemoveAll(tmpDir)
-		return ""
+		return res
 	}
 	if err := os.WriteFile(tmpBin, data, 0o755); err != nil { //nolint:gosec // executable permissions required
 		_ = os.RemoveAll(tmpDir)
-		return ""
+		return res
 	}
 	if err := os.Rename(tmpBin, exe); err != nil {
 		_ = os.Remove(tmpBin)
 		_ = os.RemoveAll(tmpDir)
-		return ""
+		return res
 	}
 
 	log(fmt.Sprintf("Updated to %s — restarting…", rel.TagName))
 	_ = os.RemoveAll(tmpDir)
-	return exe
+	return Result{Outcome: OutcomeInstalled, Tag: rel.TagName, Exe: exe}
 }
 
-func fetchLatestRelease() (*ghRelease, error) {
+func fetchLatestRelease(api string) (*ghRelease, error) {
 	client := &http.Client{Timeout: apiTimeout}
-	resp, err := client.Get(apiURL) //nolint:gosec // URL is a hardcoded constant
+	resp, err := client.Get(api) //nolint:gosec // URL is a hardcoded constant or test server
 	if err != nil {
 		return nil, err
 	}
