@@ -267,7 +267,7 @@ func (p *Player) pollState() {
 			if !ref.acquire() {
 				continue
 			}
-			secs := float64(C.vibez_get_playback_time(audio))
+			secs := float64(C.vibez_get_playback_time(ref.s))
 			ref.release()
 			if secs < 0 {
 				continue
@@ -333,12 +333,12 @@ func (p *Player) playTrack(t provider.Track) {
 		return
 	}
 
-	sampleRate := float64(C.vibez_get_sample_rate(audio))
+	sampleRate := float64(C.vibez_get_sample_rate(raw))
 	if sampleRate <= 0 {
 		sampleRate = 44100.0
 	}
 
-	frames := int64(C.vibez_get_duration(audio))
+	frames := int64(C.vibez_get_duration(raw))
 	duration := time.Duration(float64(frames) / sampleRate * float64(time.Second))
 
 	ref := newAudioRef(raw)
@@ -367,7 +367,7 @@ func (p *Player) playTrack(t provider.Track) {
 	if !ref.acquire() {
 		return
 	}
-	C.vibez_start(audio)
+	C.vibez_start(raw)
 	ref.release()
 	p.broadcast(s)
 }
