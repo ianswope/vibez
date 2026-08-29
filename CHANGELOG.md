@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - **macOS release binaries are now built on a macOS runner with CGo enabled** — `.goreleaser.yml` built the darwin artefacts with `CGO_ENABLED=0` on the Linux release runner, so a native macOS backend would compile in CI and work for anyone running `make build`, then silently fall back to its no-cgo stub in every published binary. Darwin now builds on `macos-latest` with `CGO_ENABLED=1`, and those archives are attached to the same release as the Linux ones. Nothing changes for the current feature set — every cgo package in the tree is `//go:build linux` — but the macOS local-tracks player in #62 cannot ship without it. Refs #117.
+- **A rejected developer token now acts on the update instead of only naming it** — the startup update check looks at most once every 24 hours, so a build whose embedded token had just expired could print `Developer token rejected - update vibez to continue` on the same run that skipped the check which would have fixed it. That path now asks GitHub immediately, installs and restarts when a newer release exists, and otherwise says which case it is: nothing newer published yet, `--no-update` in force, or an install that cannot replace itself. The WebKit fallback path, which ran no update check at all, gets the same handling. Refs #108, #113.
 
 ## [0.6.1] — 2026-08-21
 

@@ -55,7 +55,23 @@ func runCDPFlow(cfg *config.Config, opts tui.Options, onUserToken, onStorefront 
 				// Re-authenticating cannot mint a working developer token, so
 				// keep the user token: it is still good once the build is.
 				devTokenRejected = true
-				prog.Send(tui.InitStatusMsg(auth.DeveloperTokenStatus))
+				// The update check above may have been inside its once-a-day
+				// window and returned without asking, which is exactly what
+				// would leave the user reading "update vibez" on a build that
+				// could have updated itself. Ask again, and say what came back.
+				res := updater.UpdateNow(version.Version, noUpdate, func(msg string) {
+					prog.Send(tui.InitStatusMsg(msg))
+				})
+				if res.Outcome == updater.OutcomeInstalled {
+					restartExe <- res.Exe
+					prog.Send(tui.RestartMsg{})
+					return
+				}
+				status := auth.DeveloperTokenStatus
+				if advice := res.Advice(); advice != "" {
+					status = auth.DeveloperTokenPrefix + " - " + advice
+				}
+				prog.Send(tui.InitStatusMsg(status))
 			case auth.TokensValid:
 			}
 		}

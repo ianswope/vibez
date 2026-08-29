@@ -31,8 +31,13 @@ const (
 	DeveloperTokenRejected
 )
 
-// DeveloperTokenStatus is a one-line summary for a status bar.
-const DeveloperTokenStatus = "Developer token rejected - update vibez to continue"
+// DeveloperTokenPrefix names the failure without prescribing a fix, for
+// callers that can say something more specific about getting a working build.
+const DeveloperTokenPrefix = "Developer token rejected"
+
+// DeveloperTokenStatus is a one-line summary for a status bar, used when
+// nothing more specific about the fix is known.
+const DeveloperTokenStatus = DeveloperTokenPrefix + " - update vibez to continue"
 
 // DeveloperTokenHelp is the same failure explained where there is room for it.
 //
