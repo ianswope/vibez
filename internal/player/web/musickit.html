@@ -219,13 +219,15 @@
         //
         // There are two modes, and exactly one of them owns advancement:
         //
-        //   native   — one setQueue({songs:[...]}) builds the whole queue and
-        //              MusicKit advances, repeats and shuffles it by itself.
-        //              Navigation is skipToNextItem / skipToPreviousItem; new
-        //              songs go through playLater().
-        //   one-item — setQueue({...}) per track, vibez advances on `completed`.
-        //              The only mode that can play library items and run the
-        //              CONTENT_UNAVAILABLE → library-copy fallback.
+        //   native:   one setQueue({items:[...]}) builds the whole queue, mixing
+        //             catalog and library items freely, and MusicKit advances,
+        //             repeats and shuffles it by itself. Navigation is
+        //             skipToNextItem / skipToPreviousItem; new songs go through
+        //             playLater().
+        //   one-item: setQueue({...}) per track, vibez advances on `completed`.
+        //             This is the recovery mode. It is the only mode that sees a
+        //             per-item failure, so it is the only one that can run the
+        //             CONTENT_UNAVAILABLE to library-copy fallback.
         //
         // Two separate facts, deliberately not one flag:
         //
@@ -239,18 +241,30 @@
         //                    authority stays with MusicKit, which is why the two
         //                    cannot be the same flag.
         //
-        // Why native mode exists, measured on MusicKit 3.2526.0-prerelease.x with
-        // the #96 probe (media-element currentTime, 50 ms poll, DSOTM 50th
-        // tracks 3-5):
+        // Why native mode exists. Measured with the #96 probe on MusicKit
+        // 3.2526.0-prerelease.x, from the media element's own currentTime at a
+        // 50 ms poll. Every arm is two items over the same track pair, with the
+        // order rotated each pass so queue length and position cannot pose as a
+        // difference between designs:
         //
-        //   one-item rebuild per track   850.0 ms gap, media src changes at the
-        //                                boundary (2 distinct srcs)
-        //   native multi-item queue       20.3 ms gap, media src never changes
-        //                                (1 src), MusicKit auto-advances
+        //   arm                         n   median     range       single src
+        //   rebuild (one item/track)   11   700.0 ms   451-1000      0/11
+        //   items: catalog + library   11    23.7 ms   15-37        11/11
+        //   items: 2 catalog            6   350.0 ms   11-450        1/6
         //
-        // The src swap is the cost: a rebuild cannot start decoding the next
-        // track until the current one releases the element. A native queue never
-        // swaps, so there is nothing to wait for.
+        // The media-element src count is the invariant here, not any of those
+        // medians: one src is always under 40 ms, two are always over 300. A
+        // rebuild cannot start decoding the next track until the current one
+        // releases the element, so it always pays for a swap. A native queue
+        // never swaps, so there is nothing to wait for.
+        //
+        // Two caveats outlived the measurement, and both belong to #96 rather
+        // than to this code. An all-catalog items: queue was the worst native
+        // arm, and nothing explains why a library item in second position is the
+        // most consistent thing measured. Queue length also moves the figure on
+        // its own: the songs: form gave 26.5 ms at two items and 350.2 ms at
+        // three. So the shipped queue shape needs its own measurement before any
+        // of these numbers is quoted as this player's behaviour.
 
         let _q       = [];    // resolved items from the Apple Music API
         let _qi      = -1;    // index of the currently playing item (-1 = nothing)
@@ -272,10 +286,36 @@
         // supported replacement exists.
         let _removedIds = new Set();
 
-        // Native mode can only be used when every item is a catalog song:
-        // library items have to reach setQueue as resolved objects, which the
-        // songs:[ids] form cannot express.
-        const _allCatalog = (items) => items.every(item => !item.id.startsWith('i.'));
+        // The user's library copies of the queue's catalog songs, keyed by
+        // library ID. _libMap records which library ID belongs to which catalog
+        // song while resolving; this holds the resolved objects for them.
+        //
+        // Native mode is why they are fetched ahead of being needed. MusicKit
+        // advances by itself there, so a failing item has no call site to throw
+        // at the way _doPlayAt has one, and the recovery is to hand the index
+        // back to one-item mode. That is only cheap if the substitute is already
+        // in hand.
+        let _libItems = {};
+
+        // Warm _libItems for everything currently in _q. Deliberately not
+        // awaited: it must not add latency to the first play, and the earliest
+        // boundary that could want it is a whole track away.
+        function _warmLibItems() {
+          const wanted = [...new Set(_q.map(item => _libMap[item.id])
+                                       .filter(id => id && !_libItems[id]))];
+          if (wanted.length === 0) return;
+          const batchSize = 100;
+          for (let i = 0; i < wanted.length; i += batchSize) {
+            const batch = wanted.slice(i, i + batchSize);
+            _m().api.music('/v1/me/library/songs', { ids: batch })
+              .then(r => {
+                for (const song of r?.data?.data ?? []) _libItems[song.id] = song;
+                _log(`[js:libwarm] cached ${batch.length} library copy(s)`);
+              })
+              // Not an error path: _libraryFallback still fetches on demand.
+              .catch(e => _log(`[js:libwarm] skipped (${errName(e)})`));
+          }
+        }
 
         function _syncQueueIndex() {
           if (!_nativeQueue) return;
@@ -295,6 +335,31 @@
           }
         }
         music.addEventListener('nowPlayingItemDidChange', _syncQueueIndex);
+
+        // Native mode's blind spot. MusicKit advances on its own there, so an
+        // item that turns out to be unavailable mid-queue never reaches a
+        // try/catch: _doPlayAt's per-item handling only sees the item it was
+        // asked to play. Hand the index back to one-item mode, which does have
+        // the CONTENT_UNAVAILABLE to library-copy path, and let it recover.
+        //
+        // Written from the event surface, not measured: the #96 probes never
+        // provoked a failure inside a live native queue, so whether MusicKit
+        // reports one this way is still open. It costs nothing if the event
+        // never fires, and without it a bad item would strand the queue where
+        // one-item mode would have skipped past it.
+        music.addEventListener('mediaPlaybackError', (e) => {
+          if (!_nativeQueue) return;
+          const idx = _qi >= 0 ? _qi : 0;
+          _log(`[js:native] playback error (${errName(e?.detail ?? e)}) at #${idx}, recovering in one-item mode`);
+          _nativeQueue   = false;
+          _nativeMirrors = false;
+          // stop() rather than leaving it to _playAt's setQueue: if a build is
+          // already in flight, _playAt only records _wantIdx and returns, and
+          // MusicKit would keep advancing an abandoned queue in the meantime.
+          // That is the two-advancer state the flags above exist to prevent.
+          _m().stop().catch(() => {});
+          _playAt(idx);
+        });
 
         // Does MusicKit have somewhere to go on its own when the current item
         // completes?  Asked of MusicKit's queue rather than _qi so the answer
@@ -331,7 +396,11 @@
           _removedIds = new Set(); // the queue about to be built is authoritative
           try {
             await _stopAndWait(m);
-            await m.setQueue({ songs: _q.map(item => item.id) });
+            // items: rather than songs: so one descriptor covers both kinds and
+            // a pre-resolved library copy can be dropped straight in. Copied,
+            // because _q keeps being mutated underneath a live queue.
+            await m.setQueue({ items: _q.slice() });
+            _warmLibItems();
             if (startIdx > 0) await m.changeToMediaAtIndex(startIdx);
             _qi = startIdx;
             _nativeQueue   = true;
@@ -479,11 +548,18 @@
           const libId = _libMap[item.id];
           _log(`[js:doPlay] fallback libId=${libId||'none'}`);
           if (libId) {
+            if (_libItems[libId]) {
+              _log(`[js:doPlay] library swap OK (warmed) → retry #${idx}`);
+              _q[idx]  = _libItems[libId];
+              _wantIdx = idx; // retry via finally
+              return;
+            }
             try {
               const r = await _m().api.music('/v1/me/library/songs', { ids: [libId] });
               const lib = r?.data?.data ?? [];
               if (lib.length > 0) {
                 _log(`[js:doPlay] library swap OK → retry #${idx}`);
+                _libItems[libId] = lib[0];
                 _q[idx]  = lib[0];
                 _wantIdx = idx; // retry via finally
                 return;
@@ -796,7 +872,7 @@
             _q  = items;
             _qi = -1;
             _qUnshuffled = []; // clear any prior shuffle snapshot
-            if (items.length > 1 && _allCatalog(items)) _playNativeAt(0);
+            if (items.length > 1) _playNativeAt(0);
             else _playAt(0);
           } catch(e) { goError('setQueue failed: '+errName(e)).catch(()=>{}); }
         };
@@ -820,7 +896,7 @@
             _qi = -1;
             _qUnshuffled = []; // clear any prior shuffle snapshot
             const idx = Math.max(0, Math.min(startIdx || 0, items.length - 1));
-            if (items.length > 1 && _allCatalog(items)) _playNativeAt(idx);
+            if (items.length > 1) _playNativeAt(idx);
             else _playAt(idx);
           } catch(e) { goError('setPlaylist failed: '+errName(e)).catch(()=>{}); }
         };
@@ -834,8 +910,12 @@
             _q = _q.concat(items);
             _log(`[js:append] +${items.length} → _q.length=${_q.length} _qi=${_qi}`);
             if (_qi < 0) _playAt(0); // nothing was playing — start now
-            else if (_nativeQueue && _allCatalog(items)) {
-              try { await _m().playLater({ songs: items.map(item => item.id) }); }
+            else if (_nativeQueue) {
+              // playLater and playNext both call deferPlayback() before mutating
+              // the queue (#96 probe, phase F), which is the sanctioned way to
+              // extend one that is already playing. queue.append throws
+              // TypeError. items: again, so a library append is expressible.
+              try { await _m().playLater({ items: items.slice() }); _warmLibItems(); }
               catch(e) {
                 // Keep _nativeQueue set: MusicKit still owns the items it does
                 // have, and clearing it would double up on the next boundary.

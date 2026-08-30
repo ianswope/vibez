@@ -417,11 +417,9 @@ test('lossless/unsupported values are rejected with web max', () => {
 });
 
 // ─── Native queue mode (#96) ──────────────────────────────────────────────────
-// _allCatalog and _nativeHasNext are copied verbatim from musickit.html.
+// _nativeHasNext is copied verbatim from musickit.html.
 // The rest simulate the decision each call site makes, in the same style as the
 // _busy/playbackStateDidChange tests above.
-
-const _allCatalog = (items) => items.every(item => !item.id.startsWith('i.'));
 
 function _nativeHasNext(m) {
   if (m.repeatMode === 1 || m.repeatMode === 2) return true; // repeats itself
@@ -429,14 +427,6 @@ function _nativeHasNext(m) {
   if (!q || typeof q.length !== 'number' || typeof q.position !== 'number') return false;
   return q.position < q.length - 1;
 }
-
-console.log('\n_allCatalog()');
-test('all catalog ids → true', () =>
-  eq(_allCatalog([{ id: '1' }, { id: '2' }]), true));
-test('any library id → false', () =>
-  eq(_allCatalog([{ id: '1' }, { id: 'i.abc' }]), false));
-test('all library ids → false', () =>
-  eq(_allCatalog([{ id: 'i.a' }, { id: 'i.b' }]), false));
 
 console.log('\n_nativeHasNext()');
 test('repeat-one always has a next', () =>
@@ -457,13 +447,18 @@ test('single-item native queue with repeat off → false', () =>
   eq(_nativeHasNext({ repeatMode: 0, queue: { position: 0, length: 1 } }), false));
 
 console.log('\nNative mode entry condition');
-const wantsNative = (items) => items.length > 1 && _allCatalog(items);
+// Queue length is the whole condition now. The items: descriptor carries
+// catalog and library objects alike, so item kind no longer decides the mode
+// (#96: a mixed queue was the fastest arm measured, not a disqualifying one).
+const wantsNative = (items) => items.length > 1;
 test('multi-item all-catalog → native', () =>
   eq(wantsNative([{ id: '1' }, { id: '2' }]), true));
 test('single catalog item → one-item mode', () =>
   eq(wantsNative([{ id: '1' }]), false));
-test('multi-item with a library id → one-item mode', () =>
-  eq(wantsNative([{ id: '1' }, { id: 'i.x' }]), false));
+test('multi-item mixed catalog and library → native', () =>
+  eq(wantsNative([{ id: '1' }, { id: 'i.x' }]), true));
+test('multi-item library only → native', () =>
+  eq(wantsNative([{ id: 'i.a' }, { id: 'i.b' }]), true));
 test('empty → one-item mode', () => eq(wantsNative([]), false));
 
 console.log('\ncompleted handler: who advances');
@@ -705,7 +700,7 @@ console.log('\nAppend against a live native queue');
 const onAppend = (s, items, playLaterThrows) => {
   s.q = s.q.concat(items);
   if (s.qi < 0) { s.rebuiltAt = 0; return s; }
-  if (s.nativeQueue && _allCatalog(items)) {
+  if (s.nativeQueue) {
     if (playLaterThrows) return s; // flag deliberately left set
     s.playLater = items.map(i => i.id);
   }
@@ -722,15 +717,82 @@ test('playLater failure keeps authority so the boundary does not double up', () 
   eq(s.nativeQueue, true, 'clearing here would add a second advancer');
   eq(s.q.length, 4, 'the item is still in _q for the completed handler to reach');
 });
-test('appending a library item to a native queue does not use playLater', () => {
+test('appending a library item to a native queue also uses playLater', () => {
   const s = onAppend(makeQueueState(), [{ id: 'i.x' }], false);
-  eq(s.playLater, undefined);
+  eq(s.playLater, ['i.x'], 'items: can express a library append');
 });
 test('appending while nothing plays starts playback', () => {
   const s = makeQueueState();
   s.qi = -1;
   onAppend(s, [{ id: '4' }], false);
   eq(s.rebuiltAt, 0);
+});
+
+
+console.log('\nPre-resolved library copies');
+// Mirrors _warmLibItems' id selection: every library copy the current queue
+// could need, minus the ones already held, deduped.
+const wantedLibIds = (q, libMap, libItems) =>
+  [...new Set(q.map(item => libMap[item.id]).filter(id => id && !libItems[id]))];
+
+test('collects the library copy of each catalog item', () =>
+  eq(wantedLibIds([{ id: '1' }, { id: '2' }], { 1: 'i.a', 2: 'i.b' }, {}), ['i.a', 'i.b']));
+test('items with no library copy contribute nothing', () =>
+  eq(wantedLibIds([{ id: '1' }, { id: '2' }], { 1: 'i.a' }, {}), ['i.a']));
+test('already-warmed copies are not refetched', () =>
+  eq(wantedLibIds([{ id: '1' }, { id: '2' }], { 1: 'i.a', 2: 'i.b' }, { 'i.a': {} }), ['i.b']));
+test('the same copy behind two catalog items is fetched once', () =>
+  eq(wantedLibIds([{ id: '1' }, { id: '2' }], { 1: 'i.a', 2: 'i.a' }, {}), ['i.a']));
+test('nothing to fetch → no request', () =>
+  eq(wantedLibIds([{ id: '1' }], {}, {}), []));
+
+console.log('\nLibrary fallback prefers a warmed copy');
+// Mirrors _libraryFallback: a warmed copy is a local swap, an unwarmed one
+// costs a round trip inside the audible gap, no copy at all skips the track.
+const fallbackPlan = (item, libMap, libItems) => {
+  if (item.id.startsWith('i.')) return { action: 'skip', why: 'already library' };
+  const libId = libMap[item.id];
+  if (!libId) return { action: 'skip', why: 'no library copy' };
+  return { action: 'swap', via: libItems[libId] ? 'warmed' : 'fetch', libId };
+};
+
+test('warmed copy swaps without a fetch', () =>
+  eq(fallbackPlan({ id: '1' }, { 1: 'i.a' }, { 'i.a': {} }), { action: 'swap', via: 'warmed', libId: 'i.a' }));
+test('unwarmed copy still falls back, by fetching', () =>
+  eq(fallbackPlan({ id: '1' }, { 1: 'i.a' }, {}), { action: 'swap', via: 'fetch', libId: 'i.a' }));
+test('no library copy → skip', () =>
+  eq(fallbackPlan({ id: '1' }, {}, {}).action, 'skip'));
+test('a failing library item has nothing left to try', () =>
+  eq(fallbackPlan({ id: 'i.a' }, {}, {}).why, 'already library'));
+
+console.log('\nNative mode has no per-item catch');
+// Mirrors the mediaPlaybackError listener. MusicKit advances by itself in
+// native mode, so a failing item never reaches _doPlayAt's try/catch: the
+// index goes back to one-item mode, which can run the fallback.
+const onPlaybackError = (s) => {
+  if (!s.nativeQueue) return s;
+  s.recoverAt     = s.qi >= 0 ? s.qi : 0;
+  s.nativeQueue   = false;
+  s.nativeMirrors = false;
+  s.stopped       = true;
+  return s;
+};
+
+test('recovers at the item that failed', () => {
+  const s = onPlaybackError({ ...makeQueueState(), qi: 2 });
+  eq(s.recoverAt, 2);
+});
+test('recovery drops authority, and stops to take it back', () => {
+  const s = onPlaybackError({ ...makeQueueState(), qi: 1 });
+  eq([s.nativeQueue, s.nativeMirrors, s.stopped], [false, false, true]);
+});
+test('nothing playing recovers at the head', () => {
+  const s = onPlaybackError({ ...makeQueueState(), qi: -1 });
+  eq(s.recoverAt, 0);
+});
+test('one-item mode is left alone: _doPlayAt already caught it', () => {
+  const s = onPlaybackError({ ...makeQueueState(), nativeQueue: false, qi: 1 });
+  eq(s.recoverAt, undefined, 'recovering twice would restart the track');
 });
 
 
