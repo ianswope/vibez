@@ -3364,6 +3364,31 @@ func (m *Model) nowPlayingTextLines(contentW, h int) []string {
 	return lines[:h]
 }
 
+// playingQueueIdx returns the queue position of the track the player reports as
+// playing, or -1 if it isn't in the queue. Identity comes first, the way
+// dropQueueAfter matches: a queue can hold the same song twice, or two
+// different songs sharing a title, and matching on title alone marks every one
+// of them. Title is kept only as a last resort, because the library fallback
+// can swap a catalog entry for its library copy mid-playback, which leaves the
+// two IDs legitimately different.
+func playingQueueIdx(tracks []provider.Track, playing *provider.Track) int {
+	if playing == nil {
+		return -1
+	}
+	playingID := views.PlaybackID(*playing)
+	for i, t := range tracks {
+		if views.PlaybackID(t) == playingID {
+			return i
+		}
+	}
+	for i, t := range tracks {
+		if t.Title == playing.Title {
+			return i
+		}
+	}
+	return -1
+}
+
 // queuePanelLines returns the Queue panel lines for the left split.
 func (m *Model) queuePanelLines(w, h int) []string {
 	total := len(m.queue.m.Tracks())
@@ -3378,18 +3403,15 @@ func (m *Model) queuePanelLines(w, h int) []string {
 	}
 	sep := styles.QueueItemMuted.Render(strings.Repeat("─", 5))
 
-	currentTitle := ""
-	if m.playerState.Track != nil {
-		currentTitle = m.playerState.Track.Title
-	}
-
 	indexW := len(fmt.Sprintf("%d", total)) // digit width for index numbers
 	tracks := m.queue.m.Tracks()
+	playingIdx := playingQueueIdx(tracks, m.playerState.Track)
+
 	var trackLines []string
 	for i, t := range tracks {
 		idx := fmt.Sprintf("%*d. ", indexW, i+1)
 		label := t.Artist + " — " + t.Title
-		if t.Title == currentTitle {
+		if i == playingIdx {
 			numStr := styles.ControlActive.Render(idx)
 			line := truncateStr(label, w-2-indexW-2)
 			trackLines = append(trackLines, numStr+styles.ControlActive.Render("▶ "+line))
