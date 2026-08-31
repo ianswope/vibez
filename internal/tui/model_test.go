@@ -3094,6 +3094,102 @@ func TestQueuePanelLines_WithTracks(t *testing.T) {
 	}
 }
 
+// markedRows returns the queue rows carrying the now-playing marker.
+func markedRows(lines []string) []int {
+	var rows []int
+	for i, l := range lines {
+		if strings.Contains(l, "▶") {
+			rows = append(rows, i)
+		}
+	}
+	return rows
+}
+
+func dupAlbum(n int) []provider.Track {
+	titles := []string{"Scrivendo", "Esistere", "L'astronauta", "Ci nasci, ci muori"}
+	var out []provider.Track
+	for range n {
+		for _, title := range titles {
+			out = append(out, provider.Track{ID: "cat." + title, Title: title, Artist: "nayt"})
+		}
+	}
+	return out
+}
+
+// A queue holding the same album more than once marks one row, not one per copy.
+func TestQueuePanelLines_MarksOnlyOneRowWhenTheQueueRepeats(t *testing.T) {
+	m := newModel(nil)
+	m.width = 80
+	q := dupAlbum(3)
+	m.queueTracks = q
+	m.queue.SetTracks(q)
+	m.playerState.Track = &q[0]
+
+	marked := markedRows(m.queuePanelLines(76, 40))
+	if len(marked) != 1 {
+		t.Errorf("marked %d rows, want 1", len(marked))
+	}
+}
+
+// Two different songs that share a title: the marker follows the ID, not the name.
+func TestQueuePanelLines_MarksByIDNotTitle(t *testing.T) {
+	m := newModel(nil)
+	m.width = 80
+	q := []provider.Track{
+		{ID: "cat.1", Title: "Alive", Artist: "Artist One"},
+		{ID: "cat.2", Title: "Alive", Artist: "Someone Else"},
+	}
+	m.queueTracks = q
+	m.queue.SetTracks(q)
+	m.playerState.Track = &q[1]
+
+	lines := m.queuePanelLines(76, 10)
+	marked := markedRows(lines)
+	if len(marked) != 1 {
+		t.Fatalf("marked %d rows, want 1", len(marked))
+	}
+	if !strings.Contains(lines[marked[0]], "Someone Else") {
+		t.Errorf("marked the wrong row: %q", lines[marked[0]])
+	}
+}
+
+// The library fallback can swap a catalog entry for its library copy, so the
+// playing ID stops matching the queued one. The marker still lands, once.
+func TestQueuePanelLines_FallsBackToTitleWhenIDsDiverge(t *testing.T) {
+	m := newModel(nil)
+	m.width = 80
+	q := []provider.Track{
+		{ID: "cat.1", Title: "Scrivendo", Artist: "nayt"},
+		{ID: "cat.2", Title: "Esistere", Artist: "nayt"},
+	}
+	m.queueTracks = q
+	m.queue.SetTracks(q)
+	m.playerState.Track = &provider.Track{ID: "i.9999", CatalogID: "cat.2", Title: "Esistere", Artist: "nayt"}
+
+	lines := m.queuePanelLines(76, 10)
+	marked := markedRows(lines)
+	if len(marked) != 1 {
+		t.Fatalf("marked %d rows, want 1", len(marked))
+	}
+	if !strings.Contains(lines[marked[0]], "Esistere") {
+		t.Errorf("marked the wrong row: %q", lines[marked[0]])
+	}
+}
+
+// A track that isn't in the queue marks nothing.
+func TestQueuePanelLines_UnknownPlayingTrackMarksNothing(t *testing.T) {
+	m := newModel(nil)
+	m.width = 80
+	q := dupAlbum(1)
+	m.queueTracks = q
+	m.queue.SetTracks(q)
+	m.playerState.Track = &provider.Track{ID: "cat.elsewhere", Title: "Not Queued", Artist: "nobody"}
+
+	if marked := markedRows(m.queuePanelLines(76, 20)); len(marked) != 0 {
+		t.Errorf("marked %d rows, want 0", len(marked))
+	}
+}
+
 // ─── statusNavContent and scheduleSearch ─────────────────────────────────────
 
 func TestScheduleSearch_EmptyQuery(t *testing.T) {

@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Now-playing marker appeared on every queue row sharing the playing track's title**: the queue panel chose the `▶` marker with a title string comparison, so a queue holding the same song twice, or two different songs that happen to share a name, marked every match rather than the position actually playing. The marker now follows the playing track's position, located by playback ID the way `dropQueueAfter` locates its seed, with title kept only as a last resort so the marker survives the library fallback swapping a catalog entry for its library copy. Refs #122.
+
 ## [0.7.0] — 2026-08-29
 
 ### Changed
