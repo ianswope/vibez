@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **Track transitions no longer rebuild MusicKit's queue**: vibez called `setQueue({songs:[one id]})` at every track boundary, so each transition paid a round trip that landed exactly where the gap is audible. The queue is now built once with `setQueue({items:[...]})` and MusicKit advances it, with `next`/`prev` delegating to `skipToNextItem`/`skipToPreviousItem` and insertions going through `playNext`/`playLater`. `items:` takes resolved descriptors of either kind, so a library song no longer forces the whole queue back to per-track rebuilds. Measured over a two-item queue the boundary gap went from a 700 ms median to 23.7 ms, though the figure moves with queue length and the shipped shape has not been swept yet. Refs #96.
+
 ## [0.7.0] — 2026-08-29
 
 ### Changed
