@@ -39,7 +39,7 @@ type Player struct {
 
 	mu                 sync.RWMutex
 	state              player.State
-	subs               []chan player.State
+	bcast              player.Broadcast
 	sessionExpiredOnce sync.Once
 
 	readyCh chan struct{}
@@ -231,28 +231,16 @@ func (p *Player) sendError(err error) {
 	p.mu.Lock()
 	p.state.Error = err.Error()
 	s := p.state
-	subs := p.subs
 	p.mu.Unlock()
-	for _, ch := range subs {
-		select {
-		case ch <- s:
-		default:
-		}
-	}
+	p.bcast.Send(s)
 }
 
 func (p *Player) sendSkipped(id string) {
-	p.mu.Lock()
+	p.mu.RLock()
 	s := p.state
+	p.mu.RUnlock()
 	s.SkippedID = id
-	subs := p.subs
-	p.mu.Unlock()
-	for _, ch := range subs {
-		select {
-		case ch <- s:
-		default:
-		}
-	}
+	p.bcast.Send(s)
 }
 
 // SetUserToken injects a fresh user token into the running MusicKit.js page
@@ -269,17 +257,10 @@ func (p *Player) ResetSessionExpired() {
 }
 
 func (p *Player) sendLog(msg string) {
-	p.mu.Lock()
+	p.mu.RLock()
 	s := p.state
-	s.Log = msg
-	subs := p.subs
-	p.mu.Unlock()
-	for _, ch := range subs {
-		select {
-		case ch <- s:
-		default:
-		}
-	}
+	p.mu.RUnlock()
+	p.bcast.SendLog(s, msg)
 }
 
 type jsState struct {
@@ -327,14 +308,8 @@ func (p *Player) applyState(js jsState) {
 	}
 	p.mu.Lock()
 	p.state = s
-	subs := p.subs
 	p.mu.Unlock()
-	for _, ch := range subs {
-		select {
-		case ch <- s:
-		default:
-		}
-	}
+	p.bcast.Send(s)
 }
 
 func (p *Player) dispatch(js string) {
@@ -490,11 +465,7 @@ func (p *Player) GetState() (*player.State, error) {
 }
 
 func (p *Player) Subscribe() <-chan player.State {
-	ch := make(chan player.State, 8)
-	p.mu.Lock()
-	p.subs = append(p.subs, ch)
-	p.mu.Unlock()
-	return ch
+	return p.bcast.Subscribe()
 }
 
 func (p *Player) Close() error {

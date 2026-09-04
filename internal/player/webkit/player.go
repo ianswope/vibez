@@ -58,7 +58,7 @@ type Player struct {
 	gst     *gst.Player
 	mu      sync.RWMutex
 	state   player.State
-	subs    []chan player.State
+	bcast   player.Broadcast
 	readyCh chan struct{}
 	errCh   chan error
 
@@ -110,16 +110,11 @@ func New(devToken, userToken, storefront string, audioBitrateKbps int) (*Player,
 		p.dispatch(`window.vibezNext && window.vibezNext()`)
 	})
 	p.gst.OnError(func(e error) {
-		p.mu.Lock()
+		p.mu.RLock()
 		s := p.state
+		p.mu.RUnlock()
 		s.Error = e.Error()
-		p.mu.Unlock()
-		for _, ch := range p.subs {
-			select {
-			case ch <- s:
-			default:
-			}
-		}
+		p.bcast.Send(s)
 	})
 
 	w := webview.New(false)
@@ -303,11 +298,7 @@ func (p *Player) GetState() (*player.State, error) {
 }
 
 func (p *Player) Subscribe() <-chan player.State {
-	ch := make(chan player.State, 8)
-	p.mu.Lock()
-	p.subs = append(p.subs, ch)
-	p.mu.Unlock()
-	return ch
+	return p.bcast.Subscribe()
 }
 
 func (p *Player) Close() error {
@@ -345,15 +336,8 @@ func (p *Player) applyState(js jsState) {
 	}
 	p.mu.Lock()
 	p.state = s
-	subs := p.subs
 	p.mu.Unlock()
-
-	for _, ch := range subs {
-		select {
-		case ch <- s:
-		default:
-		}
-	}
+	p.bcast.Send(s)
 }
 
 // bindAll registers all Go functions that MusicKit JS can call.
@@ -407,29 +391,18 @@ func bindAll(w webview.WebView, p *Player) error {
 			default:
 			}
 			// Also broadcast to state subscribers so the TUI displays the error.
-			p.mu.Lock()
+			p.mu.RLock()
 			s := p.state
+			p.mu.RUnlock()
 			s.Error = msg
-			p.mu.Unlock()
-			for _, ch := range p.subs {
-				select {
-				case ch <- s:
-				default:
-				}
-			}
+			p.bcast.Send(s)
 		},
 		"goLog": func(msg string) {
 			// Debug log only — not shown in status bar.
-			p.mu.Lock()
+			p.mu.RLock()
 			s := p.state
-			s.Log = msg
-			p.mu.Unlock()
-			for _, ch := range p.subs {
-				select {
-				case ch <- s:
-				default:
-				}
-			}
+			p.mu.RUnlock()
+			p.bcast.SendLog(s, msg)
 		},
 	}
 
