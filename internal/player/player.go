@@ -39,13 +39,13 @@ type State struct {
 	Playing     bool
 	Loading     bool // true when MusicKit playbackState is loading/buffering
 	Position    time.Duration
-	Volume      float64 // 0.0–1.0
-	Bitrate     int     // streaming bitrate in kbps; 0 = unknown
-	RepeatMode  int     // RepeatModeOff / RepeatModeOne / RepeatModeAll
-	ShuffleMode bool    // true = shuffle on
-	Error       string  // non-empty when JS reports a playback error
-	Log         string  // non-empty for debug-only log entries (not shown in status bar)
-	SkippedID   string  // catalog/library ID of a track JS silently skipped (unavailable/restricted)
+	Volume      float64  // 0.0–1.0
+	Bitrate     int      // streaming bitrate in kbps; 0 = unknown
+	RepeatMode  int      // RepeatModeOff / RepeatModeOne / RepeatModeAll
+	ShuffleMode bool     // true = shuffle on
+	Error       string   // non-empty when JS reports a playback error
+	Logs        []string // debug-only log entries since the last delivered state (not shown in status bar)
+	SkippedID   string   // catalog/library ID of a track JS silently skipped (unavailable/restricted)
 }
 
 type Player interface {

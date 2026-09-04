@@ -518,10 +518,10 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case playerStateMsg:
 		wasPlaying := m.playerState.Playing
 		s := player.State(msg)
-		if s.Log != "" {
-			m.appendLog(s.Log)
-			s.Log = ""
+		for _, line := range s.Logs {
+			m.appendLog(line)
 		}
+		s.Logs = nil
 		if s.Error != "" {
 			if strings.Contains(s.Error, "CONTENT_RESTRICTED") {
 				// Track is region-locked or unavailable in this storefront.

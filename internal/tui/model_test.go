@@ -1356,17 +1356,19 @@ func TestModel_Update_PlayerStateMsg_WithLog(t *testing.T) {
 	mp := newMockPlayer()
 	m := newModel(mp)
 	m.stateCh = mp.stateCh
-	st := playerStateMsg{Playing: true, Log: "something logged"}
+	st := playerStateMsg{Playing: true, Logs: []string{"something logged", "and this too"}}
 	_, _ = m.Update(st)
-	found := false
-	for _, entry := range m.debugLog {
-		if strings.Contains(entry, "something logged") {
-			found = true
-			break
+	for _, want := range []string{"something logged", "and this too"} {
+		found := false
+		for _, entry := range m.debugLog {
+			if strings.Contains(entry, want) {
+				found = true
+				break
+			}
 		}
-	}
-	if !found {
-		t.Error("Log field in playerStateMsg should be appended to debugLog")
+		if !found {
+			t.Errorf("Logs entry %q should be appended to debugLog", want)
+		}
 	}
 }
 
