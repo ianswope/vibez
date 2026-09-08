@@ -1,7 +1,8 @@
 # PR #62 CoreAudio test plan + results (macOS side)
 
 Scratch branch for exercising the darwin/CoreAudio half of upstream PR #62 on real
-Apple hardware. Base is PR head `b306c6a`.
+Apple hardware. Base is PR head `b306c6a`. The harness now targets `74319b9`;
+`player_darwin.go` line references throughout are to that head.
 
 Two commits sit on top of that head:
 
@@ -127,13 +128,16 @@ Runtime, `b306c6a` → `9cd4c1d`:
 
 ### New: `Close()` during an EOS-driven track change is a use-after-free
 
-`playTrack` releases `p.mu` and *then* calls `C.vibez_start(audio)` on a local copy of
-the pointer (`player_darwin.go:327`). `Close` takes `p.mu` and calls
-`C.vibez_destroy(p.audio)` on the same object (`player_darwin.go:594`). The mutex guards
-the *field*, not the in-flight C call, so a `Close` landing in that window frees the
-AudioQueue/ExtAudioFile out from under a running `vibez_start`. One crash dump has both
-frames on the same address: `_Cfunc_vibez_start(0x81b548140)` and
-`_Cfunc_vibez_destroy(0x81b548140)`.
+`playTrack` releases `p.mu` and *then* calls `C.vibez_start(raw)` on a local copy of
+the pointer (`player_darwin.go:370`). At `9cd4c1d`, `Close` took `p.mu` and called
+`C.vibez_destroy(p.audio)` on the same object. The mutex guards the *field*, not the
+in-flight C call, so a `Close` landing in that window frees the AudioQueue/ExtAudioFile
+out from under a running `vibez_start`. One crash dump has both frames on the same
+address: `_Cfunc_vibez_start(0x81b548140)` and `_Cfunc_vibez_destroy(0x81b548140)`.
+On `74319b9` there is no direct destroy: `playTrack` wraps `vibez_start` in an
+`acquire()`/`release()` pair (:367-371), and `Close` nils `p.audio` under the lock
+(:656-657) then calls `old.release()` after unlocking (:663-665); the refcounted
+`audioRef` frees the object when the count reaches zero.
 
 Reproduction rates, `TestProbeCloseOnTrackChange` (poll every 5ms, `Close()` the instant
 the change is observable — `pos=0s` in the state read is the marker for being inside the
@@ -167,9 +171,10 @@ TUI agree (queue panel, `:clear`, remove/move during playback, relative `--music
 
 ## Round 3: the windows `a34eae3` leaves open
 
-`a34eae3` adds an `audioWg sync.WaitGroup` that `Close` waits on before
-`vibez_destroy`. It closes the reported repro, because `eosLoop`'s only exit is the
-`<-p.done` case, so `Wait()` (`player_darwin.go:595`) cannot return while `eosLoop` is
+`a34eae3` adds an `audioWg sync.WaitGroup` that `Close` waits on before dropping
+`p.audio` (a direct `vibez_destroy` then; `old.release()` after unlocking on `74319b9`,
+:663-665). It closes the reported repro, because `eosLoop`'s only exit is the
+`<-p.done` case, so `Wait()` (`player_darwin.go:654`) cannot return while `eosLoop` is
 inside `playTrack`. The WaitGroup counts `eosLoop` and nothing else, so three windows
 onto the same free remain. `zz_probe6_darwin_test.go` covers them.
 
@@ -185,9 +190,14 @@ go test ./internal/player/local/ -run TestProbeConcurrentPlayTrack     -v -count
 
 | Probe | Window | Destroyer | Reached from |
 |---|---|---|---|
-| `TestProbeCloseDuringManualNext` | user `Next()` vs `Close()` | `Close` `:598` | `Next` `:395`, not `eosLoop` |
-| `TestProbeClearQueueOnTrackChange` | EOS advance vs `ClearQueue()` | `ClearQueue` `:558-559` | `eosLoop`, destroyer the WaitGroup ignores |
-| `TestProbeConcurrentPlayTrack` | `playTrack` vs `playTrack` | `playTrack` `:311` | two callers, no `Close` at all |
+| `TestProbeCloseDuringManualNext` | user `Next()` vs `Close()` | `Close` `:656-657`, `:663-665` | `Next` `:442`, not `eosLoop` |
+| `TestProbeClearQueueOnTrackChange` | EOS advance vs `ClearQueue()` | `ClearQueue` `:610-611`, `:618-620` | `eosLoop`, destroyer the WaitGroup ignores |
+| `TestProbeConcurrentPlayTrack` | `playTrack` vs `playTrack` | `playTrack` `:347`, `:364-366` | two callers, no `Close` at all |
+
+Destroyer lines are `74319b9`'s: the first range takes `old := p.audio` (and nils or
+replaces it) under `p.mu`, the second calls `old.release()` after unlocking. None of the
+three calls `vibez_stop` or `vibez_destroy` directly any more; `audioRef.release()` does
+the destroy when the count reaches zero.
 
 The first is "press `n`, then `q`". The TUI puts those on different goroutines by
 construction: `n` dispatches `Next` through `playerCmd` (`internal/tui/model.go:2095`) as
@@ -210,7 +220,7 @@ total call count, no concurrency.
 directory, so a relative `./probe-corpus` resolves against `internal/player/local/` rather
 than the repo root. The old failure was silent, and it disarmed every probe in the suite:
 track IDs pointed at nothing, `LoadTracks` produced an empty queue, `SetPlaylist` returned
-`nil` at its `len(p.queue)==0` guard (`player_darwin.go:473`), and each `title != "A"`
+`nil` at its `len(p.queue)==0` guard (`player_darwin.go:524`), and each `title != "A"`
 guard then fired at t≈6ms against `track="" playing=false`, reporting "survived" without
 reaching the window. The tell in a log is `pos=0s` next to an empty title.
 

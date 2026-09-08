@@ -21,7 +21,7 @@ import (
 // internal/player/local/, not the repo root. The old failure was silent rather
 // than loud. Track IDs became paths to nothing, LoadTracks yielded an empty
 // queue, SetPlaylist returned nil at its len(p.queue)==0 guard
-// (player_darwin.go:473), and every `title != "A"` guard then fired at t~=6ms
+// (player_darwin.go:524), and every `title != "A"` guard then fired at t~=6ms
 // against track="" playing=false -- so a probe reported "survived" without ever
 // reaching the window it exists to test.
 func musicDir(t *testing.T) string {

@@ -2,8 +2,11 @@
 
 // SCAFFOLDING ONLY (not proposed code) — isolates the Close()-vs-EOS-start
 // use-after-free without depending on the undecodable .ogg. A short valid track
-// puts eosLoop inside playTrack's C.vibez_start (player_darwin.go:327) at the
-// moment Close() frees the same object under p.mu (player_darwin.go:594).
+// puts eosLoop inside playTrack's C.vibez_start (player_darwin.go:370, inside
+// an acquire()/release() hold, :367-371) at the moment Close() drops the same
+// object: p.audio = nil under p.mu (:656-657), old.release() after unlocking
+// (:663-665). The refcounted audioRef destroys it when the count reaches zero;
+// there is no direct vibez_destroy any more.
 // PROBE_CLOSE_DELAY_MS sweeps where Close() lands relative to the boundary.
 // Run alone: the fault is unrecoverable and takes the process down.
 package local
@@ -92,7 +95,7 @@ func TestProbeOggNoClose(t *testing.T) {
 // Mirrors TestProbeOggNeverEnds' structure — poll, then Close() the instant an
 // EOS-driven track change is observable — but with two ordinary decodable
 // tracks. PROBE_FIRST/PROBE_SECOND name them; a tight poll lands Close() inside
-// playTrack's post-unlock window (player_darwin.go:327) rather than after it.
+// playTrack's post-unlock window (player_darwin.go:370) rather than after it.
 func TestProbeCloseOnTrackChange(t *testing.T) {
 	dir := musicDir(t)
 

@@ -3,8 +3,9 @@
 // SCAFFOLDING ONLY (not proposed code). Covers the three Close/destroy windows
 // that a34eae3's audioWg does not close. The WaitGroup counts eosLoop only, so
 // it serialises the EOS-driven advance against Close and nothing else. Every
-// probe here reaches C.vibez_start (player_darwin.go:330) from a goroutine the
-// WaitGroup is blind to, or frees the object from a destroyer other than Close.
+// probe here reaches C.vibez_start (player_darwin.go:370) from a goroutine the
+// WaitGroup is blind to, or releases the object (old.release(), not a direct
+// vibez_destroy) from a destroyer other than Close.
 // Run each alone: the fault is unrecoverable and takes the process down.
 package local
 
@@ -80,10 +81,11 @@ func TestProbeCloseDuringManualNext(t *testing.T) {
 
 // Window 2: ClearQueue() is a second destroyer.
 //
-// :558-559 calls vibez_stop then vibez_destroy under p.mu, and audioWg is not
-// consulted, so clearing during an EOS advance frees the object eosLoop's
-// playTrack is about to start. Same polling shape as TestProbeCloseOnTrackChange,
-// with ClearQueue in place of Close.
+// :610-611 nils p.audio under p.mu and :618-620 calls old.release() after
+// unlocking; no vibez_stop or vibez_destroy of its own, and audioWg is not
+// consulted, so clearing during an EOS advance drops the reference on the
+// object eosLoop's playTrack is about to start. Same polling shape as
+// TestProbeCloseOnTrackChange, with ClearQueue in place of Close.
 func TestProbeClearQueueOnTrackChange(t *testing.T) {
 	dir := musicDir(t)
 	delay := closeDelay(t, "PROBE_CLEAR_DELAY_MS", 0)
@@ -124,13 +126,14 @@ func TestProbeClearQueueOnTrackChange(t *testing.T) {
 
 // Window 3: playTrack races itself, with no Close and no ClearQueue.
 //
-// Each call keeps a local audio and starts it after unlocking, while :311
-// destroys p.audio under the lock. Two concurrent calls interleave as: A sets
-// p.audio = audioA and unlocks, B destroys audioA and installs audioB, then A
-// calls vibez_start(audioA) on freed memory. The p.handle.Delete() and
-// cgo.NewHandle(p) pair at :316-318 is exposed the same way.
+// Each call keeps a local audio and starts it after unlocking (:370, inside an
+// acquire()/release() hold), while :347 takes old := p.audio under the lock and
+// :364-366 calls old.release() after unlocking. Two concurrent calls interleave
+// as: A sets p.audio = audioA and unlocks, B releases audioA and installs
+// audioB, then A calls vibez_start(audioA). The p.handle.Delete() and
+// cgo.NewHandle(p) pair at :348-351 is exposed the same way, still under lock.
 //
-// RepeatModeOne makes every Next() reach playTrack (:380) without depending on
+// RepeatModeOne makes every Next() reach playTrack (:427) without depending on
 // queue position. PROBE_PLAYTRACK_ROUNDS sets the iteration count.
 //
 // PROBE_PLAYTRACK_GOROUTINES is the control, and it is the only one that works
