@@ -637,7 +637,7 @@ func (p *Player) GetState() (*player.State, error) {
 	}
 	p.mu.RLock()
 	s := p.state
-	p.mu.Unlock()
+	p.mu.RUnlock()
 	return &s, nil
 }
 
