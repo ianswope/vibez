@@ -13,40 +13,8 @@ import (
 // Widevine CDM instead of downloading Google Chrome (which Google does not
 // publish for Linux/arm64). Tests drive discovery through the
 // VIBEZ_CHROME_PATH override and an overridable widevineSystemDirs list so they
-// never depend on what is actually installed on the host.
-
-// fakeBrowser writes an executable stub and points VIBEZ_CHROME_PATH at it,
-// isolating HOME and the fixed CDM search list so discovery is hermetic.
-func fakeBrowser(t *testing.T) string {
-	t.Helper()
-	dir := t.TempDir()
-	bin := filepath.Join(dir, "chromium")
-	if err := os.WriteFile(bin, []byte("#!/bin/sh\n"), 0o755); err != nil { //nolint:gosec // test fixture
-		t.Fatalf("write fake browser: %v", err)
-	}
-	t.Setenv("VIBEZ_CHROME_PATH", bin)
-	t.Setenv("HOME", dir)
-
-	saved := widevineSystemDirs
-	widevineSystemDirs = nil // only browser-adjacent discovery is exercised
-	t.Cleanup(func() { widevineSystemDirs = saved })
-	return bin
-}
-
-// installAdjacentCDM drops a fake arm64 Widevine CDM next to the given browser
-// and returns the WidevineCdm directory.
-func installAdjacentCDM(t *testing.T, browser string) string {
-	t.Helper()
-	cdmDir := filepath.Join(filepath.Dir(browser), "WidevineCdm")
-	soDir := filepath.Join(cdmDir, "_platform_specific", "linux_arm64")
-	if err := os.MkdirAll(soDir, 0o750); err != nil {
-		t.Fatalf("mkdir cdm: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(soDir, "libwidevinecdm.so"), []byte("fake cdm"), 0o644); err != nil { //nolint:gosec // test fixture
-		t.Fatalf("write cdm: %v", err)
-	}
-	return cdmDir
-}
+// never depend on what is actually installed on the host; the helpers live in
+// browser_system_test.go, shared with the amd64 override tests.
 
 func TestFindSystemBrowser_EnvOverride(t *testing.T) {
 	bin := fakeBrowser(t)

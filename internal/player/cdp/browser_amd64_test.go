@@ -6,18 +6,33 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 
 	playwright "github.com/mxschmitt/playwright-go"
 )
 
 // These tests cover the amd64 layout, where vibez downloads Google Chrome into
-// its private cache and hard-links a vibez-helper alias. The arm64 backend uses
-// a discovered system browser instead (see browser_arm64_test.go).
+// its private cache and hard-links a vibez-helper alias, and the override that
+// swaps in a system browser instead. The arm64 backend always uses a system
+// browser (see browser_arm64_test.go).
+
+// noBrowserOverride clears VIBEZ_CHROME_PATH and CHROME_PATH so the bundled
+// layout is what gets tested, whatever the developer's shell exports.
+func noBrowserOverride(t *testing.T) {
+	t.Helper()
+	t.Setenv("VIBEZ_CHROME_PATH", "")
+	t.Setenv("CHROME_PATH", "")
+}
+
+func bundledWidevineArg() string {
+	return "--widevine-path=" + filepath.Join(chromeInstallDir(), "opt", "google", "chrome", "WidevineCdm")
+}
 
 func TestChromePath_IsAbsolute(t *testing.T) {
 	tmp := t.TempDir()
 	t.Setenv("XDG_CACHE_HOME", tmp)
+	noBrowserOverride(t)
 	got := ChromePath()
 	if !filepath.IsAbs(got) {
 		t.Errorf("ChromePath() = %q, want absolute path", got)
@@ -30,6 +45,7 @@ func TestChromePath_IsAbsolute(t *testing.T) {
 func TestHelperPath_IsAbsolute(t *testing.T) {
 	tmp := t.TempDir()
 	t.Setenv("XDG_CACHE_HOME", tmp)
+	noBrowserOverride(t)
 	got := HelperPath()
 	if !filepath.IsAbs(got) {
 		t.Errorf("HelperPath() = %q, want absolute path", got)
@@ -43,6 +59,7 @@ func TestLinkHelper_CreatesHardLink(t *testing.T) {
 	// Set up a fake chrome directory structure in a temp cache dir.
 	tmp := t.TempDir()
 	t.Setenv("XDG_CACHE_HOME", tmp)
+	noBrowserOverride(t)
 
 	// Create the directories and a fake chrome binary.
 	chromeBin := ChromePath()
@@ -65,6 +82,7 @@ func TestLinkHelper_IdempotentWhenHelperExists(t *testing.T) {
 	// Set up a fake chrome + helper already present.
 	tmp := t.TempDir()
 	t.Setenv("XDG_CACHE_HOME", tmp)
+	noBrowserOverride(t)
 
 	chromeBin := ChromePath()
 	if err := os.MkdirAll(filepath.Dir(chromeBin), 0o750); err != nil {
@@ -84,6 +102,7 @@ func TestLinkHelper_IdempotentWhenHelperExists(t *testing.T) {
 func TestEnsureBrowser_AlreadyInstalled(t *testing.T) {
 	tmp := t.TempDir()
 	t.Setenv("XDG_CACHE_HOME", tmp)
+	noBrowserOverride(t)
 
 	chromeBin := ChromePath()
 	if err := os.MkdirAll(filepath.Dir(chromeBin), 0o750); err != nil {
@@ -121,5 +140,68 @@ func TestEnsureBrowser_AlreadyInstalled(t *testing.T) {
 	// No download should have been triggered.
 	if len(progress) > 0 {
 		t.Errorf("EnsureBrowser when installed should not call onProgress, got: %v", progress)
+	}
+}
+
+func TestChromePath_HonoursOverride(t *testing.T) {
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	bin := fakeBrowser(t)
+	if got := ChromePath(); got != bin {
+		t.Errorf("ChromePath() = %q, want the override %q", got, bin)
+	}
+	if got := HelperPath(); got != bin {
+		t.Errorf("HelperPath() = %q, want == override %q", got, bin)
+	}
+	linkHelper()
+	if _, err := os.Stat(filepath.Join(filepath.Dir(bin), "vibez-helper")); err == nil {
+		t.Error("linkHelper() hard-linked next to the override; expected no-op")
+	}
+	if _, err := os.Stat(chromeInstallDir()); err == nil {
+		t.Error("linkHelper() created the private Chrome dir for an override; expected no-op")
+	}
+}
+
+func TestEnsureBrowser_InvalidOverrideFailsBeforeDownload(t *testing.T) {
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	t.Setenv("VIBEZ_CHROME_PATH", filepath.Join(t.TempDir(), "does-not-exist"))
+	var progress []string
+	err := EnsureBrowser(func(s string) { progress = append(progress, s) })
+	if err == nil {
+		t.Fatal("EnsureBrowser with an unusable VIBEZ_CHROME_PATH returned nil; want error")
+	}
+	if len(progress) > 0 {
+		t.Errorf("EnsureBrowser reported progress %v before failing on the override; want none", progress)
+	}
+}
+
+func TestWidevineCDMDir_DiscoversX64CDM(t *testing.T) {
+	bin := fakeBrowser(t)
+	if got := widevineCDMDir(); got != "" {
+		t.Fatalf("widevineCDMDir() = %q before install, want empty", got)
+	}
+	want := installAdjacentCDM(t, bin)
+	if got := widevineCDMDir(); got != want {
+		t.Errorf("widevineCDMDir() = %q, want %q", got, want)
+	}
+}
+
+func TestChromeLaunchArgs_OverrideUsesSystemCDM(t *testing.T) {
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	bin := fakeBrowser(t)
+	cdmDir := installAdjacentCDM(t, bin)
+	args := chromeLaunchArgs(true, false)
+	if !slices.Contains(args, "--widevine-path="+cdmDir) {
+		t.Errorf("chromeLaunchArgs missing --widevine-path=%s; got %v", cdmDir, args)
+	}
+	if slices.Contains(args, bundledWidevineArg()) {
+		t.Errorf("chromeLaunchArgs still passes the bundled CDM with an override set; got %v", args)
+	}
+}
+
+func TestChromeLaunchArgs_BundledCDMByDefault(t *testing.T) {
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	noBrowserOverride(t)
+	if args := chromeLaunchArgs(true, false); !slices.Contains(args, bundledWidevineArg()) {
+		t.Errorf("chromeLaunchArgs missing %s; got %v", bundledWidevineArg(), args)
 	}
 }

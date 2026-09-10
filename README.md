@@ -349,7 +349,7 @@ Use `↑` / `↓` (or `ctrl+p` / `ctrl+n`) to cycle through suggestions, and `ta
 | **Chrome + Widevine** | Full tracks | Chrome (amd64) or system Chromium (arm64) via Playwright; MusicKit JS + Widevine DRM |
 | **WebKit + GStreamer** *(Linux fallback)* | 30 s previews | Embedded webkit2gtk-4.1; GStreamer decodes preview URLs |
 
-On Linux amd64, Chrome is downloaded once to `~/.cache/vibez/chrome`. On Linux arm64, vibez uses the system Chromium with a persistent profile in `~/.cache/vibez/chromium-arm64` and a system-registered Widevine CDM (registered on a one-time warm-up launch). The Playwright driver is stored in `~/.cache/vibez/driver`. On macOS, vibez uses an installed Google Chrome app.
+On Linux amd64, Chrome is downloaded once to `~/.cache/vibez/chrome`. On Linux arm64, vibez uses the system Chromium with a persistent profile in `~/.cache/vibez/chromium-arm64` and a system-registered Widevine CDM (registered on a one-time warm-up launch). Setting `VIBEZ_CHROME_PATH` (or `CHROME_PATH`) to a browser binary selects that system browser on amd64 as well, with the same persistent profile (`~/.cache/vibez/chromium-amd64`) and Widevine lookup, and nothing is downloaded. The Playwright driver is stored in `~/.cache/vibez/driver`. On macOS, vibez uses an installed Google Chrome app.
 
 ---
 
