@@ -23,6 +23,7 @@ import (
 	"github.com/godbus/dbus/v5"
 	"github.com/godbus/dbus/v5/prop"
 
+	"github.com/simone-vibes/vibez/internal/assets"
 	"github.com/simone-vibes/vibez/internal/player"
 	"github.com/simone-vibes/vibez/internal/provider"
 )
@@ -217,7 +218,7 @@ func NewServer(ctrl Controller) (*Server, error) {
 			"CanRaise":            {Value: false, Writable: false, Emit: prop.EmitFalse},
 			"HasTrackList":        {Value: false, Writable: false, Emit: prop.EmitFalse},
 			"Identity":            {Value: "vibez", Writable: false, Emit: prop.EmitFalse},
-			"DesktopEntry":        {Value: "io.github.simonepelosi.vibez", Writable: false, Emit: prop.EmitFalse},
+			"DesktopEntry":        {Value: assets.AppID, Writable: false, Emit: prop.EmitFalse},
 			"SupportedUriSchemes": {Value: []string{}, Writable: false, Emit: prop.EmitFalse},
 			"SupportedMimeTypes":  {Value: []string{}, Writable: false, Emit: prop.EmitFalse},
 		},
