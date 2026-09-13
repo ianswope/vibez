@@ -3,19 +3,18 @@
 package cdp
 
 import (
-	"runtime"
-
 	playwright "github.com/mxschmitt/playwright-go"
 )
 
 // launchBrowser starts Chromium and returns the page to drive plus a close
 // function.
 //
-// On linux/arm64 it uses a persistent profile (chromiumProfileDir) so the
-// Widevine component "hint file" — written during EnsureBrowser's warm-up — is
-// read and the CDM loads. An ephemeral profile (the default Launch) never loads
-// Widevine there because the hint only takes effect on a subsequent launch. On
-// amd64, Chrome bundles Widevine directly, so an ephemeral launch is used.
+// With a system browser (linux/arm64, or a VIBEZ_CHROME_PATH override) it uses
+// a persistent profile (chromiumProfileDir) so the Widevine component "hint
+// file", written during EnsureBrowser's warm-up, is read and the CDM loads. An
+// ephemeral profile (the default Launch) never loads Widevine there because
+// the hint only takes effect on a subsequent launch. The bundled amd64 Chrome
+// carries Widevine directly, so an ephemeral launch is used.
 //
 // Playwright injects --mute-audio into every headless Chromium launch; we strip
 // it so audio routes through PulseAudio/PipeWire. Playwright also injects
@@ -25,7 +24,7 @@ func launchBrowser(pw *playwright.Playwright, chromePath string, headless, wsl b
 	ignore := []string{"--mute-audio", "--disable-component-update"}
 	args := chromeLaunchArgs(headless, wsl)
 
-	if runtime.GOARCH == "arm64" {
+	if useSystemBrowser() {
 		ctx, err := pw.Chromium.LaunchPersistentContext(chromiumProfileDir(), playwright.BrowserTypeLaunchPersistentContextOptions{
 			ExecutablePath:    &chromePath,
 			Headless:          &headless,

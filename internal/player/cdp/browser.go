@@ -8,6 +8,9 @@
 // Subsequent launches use the cached binary instantly — no system packages,
 // no apt-get, no sudo, invisible to the rest of the OS.
 // Widevine CDM is bundled inside Chrome and is available automatically.
+//
+// Setting VIBEZ_CHROME_PATH (or CHROME_PATH) to a browser binary makes vibez
+// launch that browser instead and download nothing; see useSystemBrowser.
 package cdp
 
 import (
@@ -40,11 +43,37 @@ func chromeInstallDir() string { return filepath.Join(baseDir(), "chrome") }
 // driverDir is where the Playwright Node.js driver lives.
 func driverDir() string { return filepath.Join(baseDir(), "driver") }
 
-// ChromePath returns the path to the Chrome/Chromium binary vibez launches.
-// On amd64 this is the privately downloaded Google Chrome; on arm64 — where
-// Google publishes no Linux build — it is a discovered system Chromium/Chrome.
-func ChromePath() string {
+// browserOverride returns the environment variable and browser path a user
+// set to bypass discovery, VIBEZ_CHROME_PATH taking precedence over
+// CHROME_PATH, or two empty strings when neither is set. The path is not
+// validated here; findSystemBrowser does that.
+func browserOverride() (string, string) {
+	for _, name := range []string{"VIBEZ_CHROME_PATH", "CHROME_PATH"} {
+		if p := os.Getenv(name); p != "" {
+			return name, p
+		}
+	}
+	return "", ""
+}
+
+// useSystemBrowser reports whether vibez launches a browser it does not own:
+// always on arm64, where Google publishes no Linux Chrome, and on any arch
+// when browserOverride names one. In that mode nothing is downloaded, the
+// vibez-helper hard link is skipped, and Widevine is looked up on the system
+// instead of inside the private Chrome.
+func useSystemBrowser() bool {
 	if runtime.GOARCH == "arm64" {
+		return true
+	}
+	_, p := browserOverride()
+	return p != ""
+}
+
+// ChromePath returns the path to the Chrome/Chromium binary vibez launches:
+// the privately downloaded Google Chrome, or a system Chromium/Chrome when
+// useSystemBrowser says so.
+func ChromePath() string {
+	if useSystemBrowser() {
 		path, _ := findSystemBrowser()
 		return path
 	}
@@ -59,20 +88,20 @@ func bundledChromePath() string {
 // HelperPath returns the path to the vibez-helper hard link of the Chrome
 // binary. Launching Chrome via this path causes the process (and child
 // processes that re-exec via /proc/self/exe) to appear as "vibez-helper"
-// in ps/top instead of "chrome". On arm64 the browser lives in a read-only
-// system location we cannot hard-link into, so it equals ChromePath().
+// in ps/top instead of "chrome". A system browser lives somewhere vibez cannot
+// hard-link into, so there it equals ChromePath().
 func HelperPath() string {
-	if runtime.GOARCH == "arm64" {
+	if useSystemBrowser() {
 		return ChromePath()
 	}
 	return filepath.Join(chromeInstallDir(), "opt", "google", "chrome", "vibez-helper")
 }
 
 // linkHelper creates a hard link vibez-helper → chrome so the spawned
-// process shows as "vibez-helper" in process listings. Idempotent. No-op on
-// arm64, where the system browser is not owned by vibez.
+// process shows as "vibez-helper" in process listings. Idempotent. No-op for
+// a system browser, which vibez does not own.
 func linkHelper() {
-	if runtime.GOARCH == "arm64" {
+	if useSystemBrowser() {
 		return
 	}
 	if _, err := os.Stat(HelperPath()); err == nil {
@@ -81,13 +110,27 @@ func linkHelper() {
 	_ = os.Link(ChromePath(), HelperPath())
 }
 
-// chromeInstallHelpARM64 guides arm64 users when a browser or Widevine CDM is
-// missing. Google ships no Linux/arm64 Chrome, so vibez relies on a
-// system-installed Chromium plus a system-registered Widevine CDM.
-const chromeInstallHelpARM64 = "install Chromium and a Widevine CDM (e.g. `pacman -S chromium widevine` on Arch Linux ARM, or your distro's equivalent) — or set VIBEZ_CHROME_PATH to a browser binary"
+// systemBrowserHelp guides a user past a missing browser or Widevine CDM on
+// the system-browser path. Which advice applies turns on how vibez got here.
+// An override the user set is theirs to correct or to drop, and telling them
+// to set the variable they already set, or to install a distro Chromium they
+// never asked vibez to use, helps with neither. Dropping the override on amd64
+// returns them to the Google Chrome vibez downloads, which carries its own
+// CDM; arm64 has no such fallback, so there the advice stays "install one".
+func systemBrowserHelp() string {
+	env, _ := browserOverride()
+	switch {
+	case env == "":
+		return "install Chromium and a Widevine CDM (e.g. `pacman -S chromium widevine` on Arch Linux ARM, or your distro's equivalent), or set VIBEZ_CHROME_PATH to a browser binary"
+	case runtime.GOARCH == "amd64":
+		return "point " + env + " at a browser with a Widevine CDM, or unset it to use the Google Chrome vibez downloads, which bundles one"
+	default:
+		return "point " + env + " at a browser with a Widevine CDM, or unset it to let vibez discover a system Chromium (e.g. `pacman -S chromium widevine` on Arch Linux ARM, or your distro's equivalent)"
+	}
+}
 
 // systemBrowserCandidates lists the executables searched on PATH (in order)
-// for the arm64 full-track backend.
+// for the system-browser backend.
 func systemBrowserCandidates() []string {
 	return []string{"chromium", "chromium-browser", "google-chrome-stable", "google-chrome"}
 }
@@ -111,17 +154,15 @@ func usableExecutable(p string) bool {
 	return err == nil && !st.IsDir() && st.Mode()&0o111 != 0
 }
 
-// findSystemBrowser locates a Chromium/Chrome executable for the arm64 path.
-// Order: VIBEZ_CHROME_PATH / CHROME_PATH overrides, then known real binaries,
-// then whatever launcher is on PATH.
+// findSystemBrowser locates a Chromium/Chrome executable for the
+// system-browser path. Order: the VIBEZ_CHROME_PATH / CHROME_PATH override,
+// then known real binaries, then whatever launcher is on PATH.
 func findSystemBrowser() (string, error) {
-	for _, env := range []string{"VIBEZ_CHROME_PATH", "CHROME_PATH"} {
-		if p := os.Getenv(env); p != "" {
-			if !usableExecutable(p) {
-				return "", fmt.Errorf("%s=%q is not a usable browser executable", env, p)
-			}
-			return p, nil
+	if env, p := browserOverride(); p != "" {
+		if !usableExecutable(p) {
+			return "", fmt.Errorf("%s=%q is not a usable browser executable", env, p)
 		}
+		return p, nil
 	}
 	for _, p := range systemBrowserRealBinaries() {
 		if usableExecutable(p) {
@@ -133,14 +174,9 @@ func findSystemBrowser() (string, error) {
 			return p, nil
 		}
 	}
-	return "", fmt.Errorf("no Chromium/Chrome found on PATH; %s", chromeInstallHelpARM64)
+	return "", fmt.Errorf("no Chromium/Chrome found on PATH; %s", systemBrowserHelp())
 }
 
-// widevineCDMDir returns the first directory holding an arm64 Widevine CDM, or
-// "" if none is found. It checks well-known package locations plus the
-// directory next to the discovered browser (where Chromium keeps its CDM).
-// Chromium can also locate a system-registered CDM on its own, so callers may
-// launch without an explicit --widevine-path even when this returns "".
 // widevineSystemDirs are the fixed locations checked for a registered Widevine
 // CDM. Declared as a var so tests can substitute a controlled list.
 var widevineSystemDirs = []string{
@@ -152,6 +188,23 @@ var widevineSystemDirs = []string{
 	"/var/lib/widevine/WidevineCdm",
 }
 
+// widevinePlatformDir is the per-arch subdirectory a WidevineCdm bundle keeps
+// its shared object in. Chromium's name for amd64 is x64.
+func widevinePlatformDir() string {
+	if runtime.GOARCH == "amd64" {
+		return "linux_x64"
+	}
+	return "linux_" + runtime.GOARCH
+}
+
+// widevineCDMDir returns the first directory holding a Widevine CDM for this
+// arch, or "" if none is found. It checks well-known package locations plus the
+// directory next to the discovered browser (where Chromium keeps its CDM).
+// "" is not on its own fatal at launch: chromeLaunchArgs omits --widevine-path
+// for it and lets Chromium locate a registered CDM itself. It is fatal
+// earlier, in ensureSystemBrowser, which refuses to start a system browser it
+// could not find a CDM for rather than let playback degrade to previews
+// without saying so.
 func widevineCDMDir() string {
 	candidates := append([]string(nil), widevineSystemDirs...)
 	if home, err := os.UserHomeDir(); err == nil {
@@ -165,7 +218,7 @@ func widevineCDMDir() string {
 		}
 	}
 	for _, dir := range candidates {
-		if _, err := os.Stat(filepath.Join(dir, "_platform_specific", "linux_arm64", "libwidevinecdm.so")); err == nil {
+		if _, err := os.Stat(filepath.Join(dir, "_platform_specific", widevinePlatformDir(), "libwidevinecdm.so")); err == nil {
 			return dir
 		}
 		if _, err := os.Stat(filepath.Join(dir, "libwidevinecdm.so")); err == nil {
@@ -176,9 +229,11 @@ func widevineCDMDir() string {
 }
 
 // Available reports whether the full-track Chrome/CDP backend can run on this
-// host. On amd64 vibez downloads Google Chrome, so it is always available. On
-// arm64 it requires a system Chromium/Chrome plus a Widevine CDM. Every other
-// Linux arch uses the WebKit + GStreamer preview fallback.
+// host. On amd64 vibez downloads Google Chrome, so it is always available; a
+// VIBEZ_CHROME_PATH override is not checked here, so an unusable one fails in
+// EnsureBrowser, where the user sees why. On arm64 it requires a system
+// Chromium/Chrome plus a Widevine CDM. Every other Linux arch uses the WebKit
+// + GStreamer preview fallback.
 func Available() bool {
 	switch runtime.GOARCH {
 	case "amd64":
@@ -198,43 +253,46 @@ func Available() bool {
 // onProgress is called with human-readable status strings (e.g. "Downloading
 // Chrome… 42%", "Extracting Chrome…"). Pass func(string){} to silence.
 func EnsureBrowser(onProgress func(string)) error {
-	if runtime.GOARCH == "arm64" {
-		return ensureBrowserARM64(onProgress)
+	if useSystemBrowser() {
+		return ensureSystemBrowser(onProgress)
 	}
 	return ensureBrowserAMD64(onProgress)
 }
 
-// ensureBrowserARM64 prepares the arm64 full-track backend. Google publishes no
-// Linux/arm64 Chrome, so rather than download a browser it verifies a system
-// Chromium/Chrome and a system-registered Widevine CDM are present, then
+// ensureSystemBrowser prepares the full-track backend around a browser vibez
+// does not own: always on arm64, where Google publishes no Linux Chrome, and
+// wherever VIBEZ_CHROME_PATH / CHROME_PATH points at one. Rather than download
+// a browser it verifies a Chromium/Chrome and a Widevine CDM are present, then
 // fetches only the arch-aware Playwright Node driver.
-func ensureBrowserARM64(onProgress func(string)) error {
+func ensureSystemBrowser(onProgress func(string)) error {
 	browser, err := findSystemBrowser()
 	if err != nil {
 		return err
 	}
 	onProgress(fmt.Sprintf("Using system browser: %s", browser))
 	if widevineCDMDir() == "" {
-		return fmt.Errorf("no Widevine CDM found (required for full-track playback); %s", chromeInstallHelpARM64)
+		return fmt.Errorf("no Widevine CDM found (required for full-track playback); %s", systemBrowserHelp())
 	}
 
 	onProgress("Fetching dependencies…")
 	if err := installPlaywrightDriver(); err != nil {
 		return err
 	}
-	if err := warmUpWidevineARM64(onProgress); err != nil {
+	if err := warmUpWidevine(onProgress); err != nil {
 		return err
 	}
 	onProgress("Browser ready.")
 	return nil
 }
 
-// chromiumProfileDir is the persistent Chromium profile vibez uses on arm64.
-// A persistent profile is required because the system Chromium registers its
-// Widevine CDM through the component-updater, which writes a "hint file" into
-// the profile on first launch that only takes effect on subsequent launches.
-// An ephemeral profile (Playwright's default) would never load Widevine.
-func chromiumProfileDir() string { return filepath.Join(baseDir(), "chromium-arm64") }
+// chromiumProfileDir is the persistent Chromium profile vibez uses with a
+// system browser: chromium-arm64 on arm64, as before, chromium-amd64 for an
+// override there. A persistent profile is required because the system
+// Chromium registers its Widevine CDM through the component-updater, which
+// writes a "hint file" into the profile on first launch that only takes effect
+// on subsequent launches. An ephemeral profile (Playwright's default) would
+// never load Widevine.
+func chromiumProfileDir() string { return filepath.Join(baseDir(), "chromium-"+runtime.GOARCH) }
 
 // widevineHintFile is the marker Chromium writes once it has registered the
 // preinstalled Widevine CDM into chromiumProfileDir.
@@ -242,11 +300,11 @@ func widevineHintFile() string {
 	return filepath.Join(chromiumProfileDir(), "WidevineCdm", "latest-component-updated-widevine-cdm")
 }
 
-// warmUpWidevineARM64 launches the system Chromium once against the persistent
+// warmUpWidevine launches the system Chromium once against the persistent
 // profile so its component-updater registers the preinstalled Widevine CDM and
 // writes the hint file. It is a no-op once the hint file exists. Without this,
 // the first playback session would silently fall back to previews.
-func warmUpWidevineARM64(onProgress func(string)) error {
+func warmUpWidevine(onProgress func(string)) error {
 	if _, err := os.Stat(widevineHintFile()); err == nil {
 		return nil // Widevine already registered in this profile
 	}
@@ -275,7 +333,7 @@ func warmUpWidevineARM64(onProgress func(string)) error {
 		}
 		time.Sleep(250 * time.Millisecond)
 	}
-	return fmt.Errorf("timed out waiting for the Widevine CDM to register; %s", chromeInstallHelpARM64)
+	return fmt.Errorf("timed out waiting for the Widevine CDM to register; %s", systemBrowserHelp())
 }
 
 // ensureBrowserAMD64 downloads and extracts Google Chrome into vibez's private
@@ -413,8 +471,8 @@ func runPlaywright() (*playwright.Playwright, error) {
 
 func chromeLaunchArgs(headless bool, wsl bool) []string {
 	var widevinePath string
-	if runtime.GOARCH == "arm64" {
-		// System Chromium locates its registered CDM itself; pass the path
+	if useSystemBrowser() {
+		// A system browser locates its registered CDM itself; pass the path
 		// only when we found one, so a non-default location still works.
 		widevinePath = widevineCDMDir()
 	} else {
@@ -462,8 +520,9 @@ func launchArgs(widevinePath string, headless bool, wsl bool) []string {
 		"--disable-background-networking",
 	}
 
-	// On amd64 this is always the bundled Chrome's CDM; on arm64 it is set only
-	// when a CDM directory was discovered (otherwise Chromium self-locates it).
+	// With the bundled Chrome this is its own CDM; with a system browser it is
+	// set only when a CDM directory was discovered (otherwise Chromium
+	// self-locates it).
 	if widevinePath != "" {
 		args = append(args, "--widevine-path="+widevinePath)
 	}
