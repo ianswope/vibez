@@ -70,10 +70,6 @@ func (p *Player) currentState() player.State {
 func (p *Player) playTrack(t provider.Track) {
 	uri := fmt.Sprintf("file://%s", t.ID[len("local:"):])
 	p.gst.PlayURI(uri)
-	time.Sleep(200 * time.Millisecond)
-	if d := p.gst.Duration(); d > 0 {
-		t.Duration = d
-	}
 	p.mu.Lock()
 	p.state.Track = &t
 	p.state.Playing = true

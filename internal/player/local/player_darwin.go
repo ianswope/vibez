@@ -21,7 +21,9 @@ typedef struct {
 	AudioQueueRef queue;
 	ExtAudioFileRef file;
 	AudioStreamBasicDescription format;
+	AudioQueueBufferRef bufs[3];
 	int done;
+	int playing;
 	uintptr_t goPlayer;
 } vibez_audio_state;
 
@@ -96,26 +98,29 @@ static vibez_audio_state* vibez_open(const char *uri){
 static void vibez_start(vibez_audio_state *s){
 	// Pre filling all buffers before starting
 	for(int i=0; i<kNumBuffers; i++){
-		AudioQueueBufferRef buf;
-		AudioQueueAllocateBuffer(s->queue, kBufferSize, &buf);
-		if(vibez_fill_buffer(s, buf)){
+		AudioQueueAllocateBuffer(s->queue, kBufferSize, &s->bufs[i]);
+		if(vibez_fill_buffer(s, s->bufs[i])){
 			s->done = 1;
 			break;
 		}
-		AudioQueueEnqueueBuffer(s->queue, buf, 0, NULL);
+		AudioQueueEnqueueBuffer(s->queue, s->bufs[i], 0, NULL);
 	}
+	s->playing = 1;
 	AudioQueueStart(s->queue, NULL);
 }
 
 static void vibez_pause(vibez_audio_state *s){
+	s->playing = 0;
 	AudioQueuePause(s->queue);
 }
 
 static void vibez_resume(vibez_audio_state *s){
+	s->playing = 1;
 	AudioQueueStart(s->queue, NULL);
 }
 
 static void vibez_stop(vibez_audio_state *s){
+	s->playing = 0;
 	AudioQueueStop(s->queue, true);
 }
 
@@ -144,15 +149,13 @@ static void vibez_seek(vibez_audio_state *s, SInt64 frame){
 	ExtAudioFileSeek(s->file, frame);
 	s->done = 0;
 	for (int i=0; i< kNumBuffers; i++) {
-		AudioQueueBufferRef buf;
-		AudioQueueAllocateBuffer(s->queue, kBufferSize, &buf);
-		if (vibez_fill_buffer(s, buf)) {
+		if (vibez_fill_buffer(s, s->bufs[i])) {
 			s->done = 1;
 			break;
 		}
-		AudioQueueEnqueueBuffer(s->queue, buf, 0, NULL);
+		AudioQueueEnqueueBuffer(s->queue, s->bufs[i], 0, NULL);
 	}
-	if (!s->done) {
+	if (!s->done && s->playing) {
 		AudioQueueStart(s->queue, NULL);
 	}
 }
