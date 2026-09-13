@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Discovery mode and vibe search returned little or nothing**: catalog song search went to `amp-api.music.apple.com`, an undocumented web-player endpoint, which has been rejecting developer/user token pairs that the supported endpoints accept. #118 added a retry against `api.music.apple.com`, but the rejection still had to happen first, and until it did the songs leg contributed nothing. Since a failing songs leg is not fatal to `Search`, discovery was left refilling from the user's library alone, which is why it returned unrelated tracks for users who had the artist and an empty queue for users who did not. Catalog search now goes straight to `api.music.apple.com`, the host albums and playlists already use. That endpoint does not return `extendedAssetUrls`, so the stream-availability filter is gone and playback is the final authority on storefront availability, matching how catalog album and playlist tracks have been queued since #82. Closes #93.
+
 ### Changed
 - **Track transitions no longer rebuild MusicKit's queue**: vibez called `setQueue({songs:[one id]})` at every track boundary, so each transition paid a round trip that landed exactly where the gap is audible. The queue is now built once with `setQueue({items:[...]})` and MusicKit advances it, with `next`/`prev` delegating to `skipToNextItem`/`skipToPreviousItem` and insertions going through `playNext`/`playLater`. `items:` takes resolved descriptors of either kind, so a library song no longer forces the whole queue back to per-track rebuilds. Measured over a two-item queue the boundary gap went from a 700 ms median to 23.7 ms, though the figure moves with queue length and the shipped shape has not been swept yet. Refs #96.
 
