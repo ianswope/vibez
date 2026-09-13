@@ -20,7 +20,7 @@ import (
 
 const (
 	defaultBaseURL         = "https://api.music.apple.com/v1"
-	defaultCatalogURL      = "https://amp-api.music.apple.com/v1" // used for catalog search: returns extendedAssetUrls
+	defaultCatalogURL      = "https://amp-api.music.apple.com/v1" // no longer used by search; see newCatalogRequest
 	favoritesPlaylistID    = "vibez:favorites"
 	favoritesPlaylistName  = "Favorites"
 	ratingBatchSize        = 100
@@ -107,9 +107,14 @@ func (a *AppleProvider) newRequest(ctx context.Context, method, endpoint string)
 }
 
 // newCatalogRequest builds a request against the catalog (amp-api) base URL.
-// amp-api.music.apple.com is the endpoint used by the Apple Music web player;
-// unlike the standard API it returns extendedAssetUrls in search responses,
-// which lets us reliably detect purchase-only / region-locked tracks.
+// amp-api.music.apple.com is the endpoint used by the Apple Music web player,
+// and the only one that returns extendedAssetUrls in search responses.
+//
+// Nothing reaches this any more: #82 moved album and playlist tracks to the
+// standard host, and #93 moved catalog search there too, so every
+// fetchSongsPaginated caller now passes isCatalog=false. Kept rather than
+// deleted because removing it is a judgement call about whether vibez is done
+// with amp-api, not a consequence of either change.
 func (a *AppleProvider) newCatalogRequest(ctx context.Context, method, endpoint string) (*http.Request, error) {
 	u := endpoint
 	if !strings.HasPrefix(u, "http://") && !strings.HasPrefix(u, "https://") {
@@ -183,25 +188,6 @@ type playParams struct {
 	CatalogID string `json:"catalogId"` // catalog ID for library songs — use this for playback
 }
 
-// extendedAssetURLs is returned when the catalog search is made with
-// extend=extendedAssetUrls. Its presence indicates that the song can actually
-// be streamed with an Apple Music subscription. Songs available only for
-// purchase (or unavailable in the user's storefront) will have this field nil.
-type extendedAssetURLs struct {
-	Plus             string `json:"plus"`
-	HLSMediaPlaylist string `json:"hlsMediaPlaylist"`
-	EnhancedHLS      string `json:"enhancedHls"`
-	LightTunnel      string `json:"lightTunnel"`
-}
-
-func (e *extendedAssetURLs) hasStream() bool {
-	// Only the `plus` field signals that a song is streamable with an Apple
-	// Music subscription. The other fields (hlsMediaPlaylist, enhancedHls,
-	// lightTunnel) may be present for purchase-only or preview-only tracks
-	// that will still fail with CONTENT_RESTRICTED at playback time.
-	return e != nil && e.Plus != ""
-}
-
 type songAttributes struct {
 	Name       string       `json:"name"`
 	ArtistName string       `json:"artistName"`
@@ -211,9 +197,8 @@ type songAttributes struct {
 	Previews   []struct {
 		URL string `json:"url"`
 	} `json:"previews"`
-	GenreNames        []string           `json:"genreNames"`
-	PlayParams        *playParams        `json:"playParams"`
-	ExtendedAssetURLs *extendedAssetURLs `json:"extendedAssetUrls"`
+	GenreNames []string    `json:"genreNames"`
+	PlayParams *playParams `json:"playParams"`
 }
 
 type songResource struct {
@@ -367,9 +352,8 @@ func (a *AppleProvider) Search(ctx context.Context, query string) (*provider.Sea
 		err       error
 	}
 	type catSongsOut struct {
-		songs           []songResource
-		verifiedStreams bool
-		err             error
+		songs []songResource
+		err   error
 	}
 	type catCollOut struct {
 		albums    []albumResource
@@ -404,41 +388,28 @@ func (a *AppleProvider) Search(ctx context.Context, query string) (*provider.Sea
 		}
 	}()
 
-	// Catalog songs via amp-api: returns extendedAssetUrls so we can filter
-	// purchase-only / region-locked tracks before they reach the queue.
+	// Catalog songs via the standard API, the same host albums and playlists
+	// use. amp-api.music.apple.com answered this leg until #118 made it a
+	// fallback, because it alone returns extendedAssetUrls. It is an
+	// undocumented web-player endpoint, it has now spent months rejecting
+	// token pairs the supported endpoints accept, and a leg that 401s leaves
+	// discovery with only the user's library to refill from.
 	go func() {
 		sf, err := a.storefront(ctx)
 		if err != nil {
 			catSongsCh <- catSongsOut{err: err}
 			return
 		}
-		ep := fmt.Sprintf("/catalog/%s/search?term=%s&types=songs&limit=25&extend=extendedAssetUrls",
+		ep := fmt.Sprintf("/catalog/%s/search?term=%s&types=songs&limit=25",
 			sf, url.QueryEscape(query))
-		req, err := a.newCatalogRequest(ctx, http.MethodGet, ep)
+		req, err := a.newRequest(ctx, http.MethodGet, ep)
 		if err != nil {
 			catSongsCh <- catSongsOut{err: err}
 			return
 		}
 		var resp searchResponse
-		if err := a.do(req, &resp); err == nil {
-			catSongsCh <- catSongsOut{songs: resp.Results.Songs.Data, verifiedStreams: true}
-			return
-		}
-
-		// amp-api is an undocumented web-player endpoint and can reject otherwise
-		// valid developer/user tokens. Fall back to Apple's supported catalog
-		// search. It omits extendedAssetUrls, so playback remains the final
-		// authority for storefront availability.
-		fallbackEP := fmt.Sprintf("/catalog/%s/search?term=%s&types=songs&limit=25",
-			sf, url.QueryEscape(query))
-		fallbackReq, fallbackErr := a.newRequest(ctx, http.MethodGet, fallbackEP)
-		if fallbackErr != nil {
-			catSongsCh <- catSongsOut{err: fallbackErr}
-			return
-		}
-		resp = searchResponse{}
-		if fallbackErr = a.do(fallbackReq, &resp); fallbackErr != nil {
-			catSongsCh <- catSongsOut{err: fallbackErr}
+		if err := a.do(req, &resp); err != nil {
+			catSongsCh <- catSongsOut{err: err}
 			return
 		}
 		catSongsCh <- catSongsOut{songs: resp.Results.Songs.Data}
@@ -512,18 +483,17 @@ func (a *AppleProvider) Search(ctx context.Context, query string) (*provider.Sea
 	// Songs without PlayParams are radio-only / unavailable and will always fail
 	// in MusicKit, so we drop them here before they can pollute the queue.
 	// We also require kind == "song" to exclude music videos, radio episodes, etc.
-	// Finally, we require extendedAssetUrls to be present and non-empty: songs
-	// that lack streaming URLs are purchase-only or unavailable in the user's
-	// storefront, so they would fail on playback too.
+	// This is the whole filter: the standard catalog endpoint returns no
+	// extendedAssetUrls, so streamability cannot be checked here, and playback
+	// is the final authority on storefront availability. Catalog album and
+	// playlist tracks have reached the queue on exactly these terms since #82
+	// flipped them off amp-api.
 	if catSongs.err == nil {
 		for _, s := range catSongs.songs {
 			if s.Attributes.PlayParams == nil {
 				continue
 			}
 			if s.Attributes.PlayParams.Kind != "song" {
-				continue
-			}
-			if catSongs.verifiedStreams && !s.Attributes.ExtendedAssetURLs.hasStream() {
 				continue
 			}
 			t := toTrack(s)

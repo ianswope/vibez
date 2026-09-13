@@ -177,16 +177,16 @@ func TestSearch_CatalogTracksIncluded(t *testing.T) {
 }
 
 func TestSearch_UnplayableCatalogTracksDropped(t *testing.T) {
-	// Songs without playParams (radio-only) OR without extendedAssetUrls
-	// (purchase-only) must both be filtered out; only genuinely streamable
-	// tracks should reach the result list.
+	// What the standard catalog endpoint can tell us: playParams must be
+	// present (absent means radio-only, which always fails in MusicKit) and
+	// kind must be "song" (excluding music videos and radio episodes).
 	playable := songJSON("111", "Playable Song", "Artist A", "Album A", 200000, "")
 	noPlayParams := songJSONNoPlay("222", "Radio Song", "Artist B", "Album B", 200000)
-	purchaseOnly := songJSONNoStream("333", "Buy Only Song", "Artist C", "Album C", 200000)
+	musicVideo := songJSONKind("444", "Video Song", "Artist D", "Album D", 200000, "musicVideo")
 	libEmpty := map[string]any{"results": map[string]any{}}
 	catResp := map[string]any{
 		"results": map[string]any{
-			"songs":     map[string]any{"data": []any{playable, noPlayParams, purchaseOnly}},
+			"songs":     map[string]any{"data": []any{playable, noPlayParams, musicVideo}},
 			"albums":    map[string]any{"data": []any{}},
 			"playlists": map[string]any{"data": []any{}},
 		},
@@ -204,6 +204,37 @@ func TestSearch_UnplayableCatalogTracksDropped(t *testing.T) {
 	}
 	if len(result.Tracks) != 1 || result.Tracks[0].ID != "111" {
 		t.Errorf("expected only playable track 111, got %+v", result.Tracks)
+	}
+}
+
+// Streamability is no longer part of the filter. Only amp-api reports it, and
+// requiring a field the supported endpoint never sends is what emptied the
+// queue in #93. A purchase-only or region-locked track now reaches the queue
+// and fails at playback, which is how catalog album and playlist tracks have
+// behaved since #82.
+func TestSearch_CatalogSongWithoutAssetURLsKept(t *testing.T) {
+	purchaseOnly := songJSONNoStream("333", "Buy Only Song", "Artist C", "Album C", 200000)
+	libEmpty := map[string]any{"results": map[string]any{}}
+	catResp := map[string]any{
+		"results": map[string]any{
+			"songs":     map[string]any{"data": []any{purchaseOnly}},
+			"albums":    map[string]any{"data": []any{}},
+			"playlists": map[string]any{"data": []any{}},
+		},
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		searchHandler(t, w, r, libEmpty, catResp)
+	}))
+	defer srv.Close()
+
+	p := newTestProvider(t, srv)
+	result, err := p.Search(context.Background(), "song")
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	if len(result.Tracks) != 1 || result.Tracks[0].ID != "333" {
+		t.Errorf("Tracks: got %+v, want track 333 kept despite carrying no streaming URLs", result.Tracks)
 	}
 }
 
@@ -322,75 +353,65 @@ func TestSearch_NoWarningsWhenAllLegsSucceed(t *testing.T) {
 	}
 }
 
-// The amp-api leg can reject tokens that work everywhere else. When it does,
-// the supported /catalog/{sf}/search endpoint is retried — and because that
-// endpoint never returns extendedAssetUrls, the stream filter must be skipped
-// for its results. Applying it would drop every fallback result for lacking a
-// field the endpoint does not send, which is the empty-songs bug this fixes.
-func TestSearch_CatalogSongsFallBackWhenAmpAPIRejects(t *testing.T) {
-	// Exactly the shape the fallback returns: playable, but no extendedAssetUrls.
-	fallbackSong := songJSONNoStream("777", "Fallback Song", "Artist", "Album", 210000)
+// The catalog songs leg goes to the supported host, unconditionally and on the
+// first attempt. amp-api answered it until #118 demoted it to a fallback; it
+// spent months 401ing token pairs the supported endpoints accept, and each
+// rejection left discovery refilling from the user's library alone. There is
+// no retry left to hide that, so the request must not ask for
+// extendedAssetUrls, and a 401 must surface as a warning rather than silently
+// producing an empty songs leg.
+func TestSearch_CatalogSongsUseTheSupportedHost(t *testing.T) {
+	song := songJSONNoStream("777", "Catalog Song", "Artist", "Album", 210000)
 	empty := map[string]any{"results": map[string]any{}}
 
-	var ampCalls, fallbackCalls atomic.Int32
+	var songCalls, extendCalls atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.RawQuery, "extend=extendedAssetUrls") {
+			extendCalls.Add(1)
+		}
 		switch {
 		case strings.Contains(r.URL.Path, "/me/library/search"):
 			writeJSON(t, w, empty)
 		case r.URL.Query().Get("types") != "songs":
 			writeJSON(t, w, empty) // albums/playlists leg
-		case strings.Contains(r.URL.RawQuery, "extend=extendedAssetUrls"):
-			ampCalls.Add(1)
-			w.WriteHeader(http.StatusUnauthorized) // amp-api rejects the token
 		default:
-			fallbackCalls.Add(1)
+			songCalls.Add(1)
 			writeJSON(t, w, map[string]any{"results": map[string]any{
-				"songs": map[string]any{"data": []any{fallbackSong}},
+				"songs": map[string]any{"data": []any{song}},
 			}})
 		}
 	}))
 	defer srv.Close()
 
 	p := newTestProvider(t, srv)
-	result, err := p.Search(context.Background(), "fallback song")
+	result, err := p.Search(context.Background(), "catalog song")
 	if err != nil {
 		t.Fatalf("Search: %v", err)
 	}
-	if got := ampCalls.Load(); got != 1 {
-		t.Errorf("amp-api calls: got %d, want 1", got)
+	if got := songCalls.Load(); got != 1 {
+		t.Errorf("catalog song calls: got %d, want exactly 1", got)
 	}
-	if got := fallbackCalls.Load(); got != 1 {
-		t.Errorf("fallback calls: got %d, want 1 — the retry did not happen", got)
+	if got := extendCalls.Load(); got != 0 {
+		t.Errorf("extend=extendedAssetUrls calls: got %d, want 0", got)
 	}
 	if len(result.Tracks) != 1 || result.Tracks[0].ID != "777" {
-		t.Fatalf("Tracks: got %+v, want the fallback track 777 kept despite having no extendedAssetUrls", result.Tracks)
+		t.Fatalf("Tracks: got %+v, want the catalog track 777", result.Tracks)
 	}
 	if len(result.Warnings) != 0 {
-		t.Errorf("Warnings: got %v, want none — the fallback succeeded", result.Warnings)
+		t.Errorf("Warnings: got %v, want none", result.Warnings)
 	}
 }
 
-// The filter must still apply on the amp-api path, where the field IS returned:
-// the fallback loosens it only for the endpoint that cannot report it.
-func TestSearch_StreamFilterStillAppliesWhenAmpAPISucceeds(t *testing.T) {
-	playable := songJSON("111", "Playable", "Artist", "Album", 200000, "")
-	purchaseOnly := songJSONNoStream("333", "Buy Only", "Artist", "Album", 200000)
+func TestSearch_CatalogSongRejectionWarnsInsteadOfSilentlyEmptying(t *testing.T) {
 	empty := map[string]any{"results": map[string]any{}}
-
-	var fallbackCalls atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case strings.Contains(r.URL.Path, "/me/library/search"):
 			writeJSON(t, w, empty)
 		case r.URL.Query().Get("types") != "songs":
 			writeJSON(t, w, empty)
-		case strings.Contains(r.URL.RawQuery, "extend=extendedAssetUrls"):
-			writeJSON(t, w, map[string]any{"results": map[string]any{
-				"songs": map[string]any{"data": []any{playable, purchaseOnly}},
-			}})
 		default:
-			fallbackCalls.Add(1)
-			writeJSON(t, w, empty)
+			w.WriteHeader(http.StatusUnauthorized)
 		}
 	}))
 	defer srv.Close()
@@ -400,11 +421,11 @@ func TestSearch_StreamFilterStillAppliesWhenAmpAPISucceeds(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Search: %v", err)
 	}
-	if got := fallbackCalls.Load(); got != 0 {
-		t.Errorf("fallback calls: got %d, want 0 — amp-api succeeded", got)
+	if len(result.Tracks) != 0 {
+		t.Errorf("Tracks: got %+v, want none", result.Tracks)
 	}
-	if len(result.Tracks) != 1 || result.Tracks[0].ID != "111" {
-		t.Fatalf("Tracks: got %+v, want only the streamable track 111", result.Tracks)
+	if len(result.Warnings) != 1 || !strings.Contains(result.Warnings[0], "catalog song search") {
+		t.Errorf("Warnings: got %v, want one naming the catalog song search", result.Warnings)
 	}
 }
 
@@ -837,11 +858,19 @@ func songJSON(id, name, artist, album string, durationMs int, artURL string) map
 			"artwork":          map[string]any{"url": artURL, "width": 300, "height": 300},
 			"previews":         []any{},
 			"genreNames":       []string{},
-			// Catalog songs with playParams and extendedAssetUrls.plus are streamable
-			"playParams":        map[string]any{"id": id, "kind": "song"},
-			"extendedAssetUrls": map[string]any{"plus": "https://aod.itunes.apple.com/itunes-assets/" + id},
+			// playParams with kind "song" is the whole playability contract
+			// the standard catalog endpoint can report.
+			"playParams": map[string]any{"id": id, "kind": "song"},
 		},
 	}
+}
+
+// songJSONKind produces a catalog song fixture whose playParams carry a kind
+// other than "song" (music video, radio episode), which Search drops.
+func songJSONKind(id, name, artist, album string, durationMs int, kind string) map[string]any {
+	s := songJSON(id, name, artist, album, durationMs, "")
+	s["attributes"].(map[string]any)["playParams"] = map[string]any{"id": id, "kind": kind}
+	return s
 }
 
 // songJSONNoPlay produces a catalog song fixture without playParams (radio-only / unplayable).
@@ -862,25 +891,14 @@ func songJSONNoPlay(id, name, artist, album string, durationMs int) map[string]a
 }
 
 // songJSONNoStream produces a catalog song with playParams but an explicit
-// empty extendedAssetUrls (purchase-only / not streamable with Apple Music
-// subscription). This is distinct from a nil/absent field, which means unknown.
+// empty extendedAssetUrls, the shape of a purchase-only or region-locked
+// track. Search no longer reads that field (the standard catalog endpoint does
+// not send it), so this is kept only to prove such a song now survives the
+// filter rather than being dropped for a field vibez cannot see.
 func songJSONNoStream(id, name, artist, album string, durationMs int) map[string]any {
-	return map[string]any{
-		"id": id,
-		"attributes": map[string]any{
-			"name":             name,
-			"artistName":       artist,
-			"albumName":        album,
-			"durationInMillis": durationMs,
-			"artwork":          map[string]any{"url": "", "width": 300, "height": 300},
-			"previews":         []any{},
-			"genreNames":       []string{},
-			// has playParams but extendedAssetUrls is explicitly empty —
-			// purchase-only, filtered out by Search()
-			"playParams":        map[string]any{"id": id, "kind": "song"},
-			"extendedAssetUrls": map[string]any{},
-		},
-	}
+	s := songJSON(id, name, artist, album, durationMs, "")
+	s["attributes"].(map[string]any)["extendedAssetUrls"] = map[string]any{}
+	return s
 }
 
 func albumJSON(id, name, artist string, trackCount int) map[string]any {
