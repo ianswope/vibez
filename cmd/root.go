@@ -88,9 +88,10 @@ func runTUI(_ *cobra.Command, _ []string) error {
 		return fmt.Errorf("apple developer token not set.\n\nSet apple_developer_token in ~/.config/vibez/config.json\nor run: go run ./scripts/gen-devtoken")
 	}
 
-	// Install icon and .desktop entry on every launch (idempotent, best-effort).
-	// The .desktop file has NoDisplay=true so it stays invisible to app launchers
-	// but lets the DE resolve the icon via the MPRIS DesktopEntry property.
+	// Make sure the desktop can resolve the MPRIS DesktopEntry property to an
+	// icon (idempotent, best-effort). An install that brought its own entry and
+	// icon, such as a package or the install script, is left alone; otherwise a
+	// hidden fallback entry is written once.
 	iconPath := assets.InstallIcon()
 	assets.InstallDesktopEntry()
 	opts.IconPath = iconPath
