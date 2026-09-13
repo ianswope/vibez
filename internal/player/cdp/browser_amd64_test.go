@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 
 	playwright "github.com/mxschmitt/playwright-go"
@@ -203,5 +204,48 @@ func TestChromeLaunchArgs_BundledCDMByDefault(t *testing.T) {
 	noBrowserOverride(t)
 	if args := chromeLaunchArgs(true, false); !slices.Contains(args, bundledWidevineArg()) {
 		t.Errorf("chromeLaunchArgs missing %s; got %v", bundledWidevineArg(), args)
+	}
+}
+
+// The override makes the system-browser path reachable on amd64, where the
+// arm64 guidance is wrong twice over: it names a distro that is not this one,
+// and it suggests setting the variable the user has already set.
+func TestSystemBrowserHelp_OverrideAdviceSuitsAMD64(t *testing.T) {
+	fakeBrowser(t)
+	got := systemBrowserHelp()
+	if !strings.Contains(got, "VIBEZ_CHROME_PATH") {
+		t.Errorf("systemBrowserHelp() = %q, want it to name the override in force", got)
+	}
+	if !strings.Contains(got, "unset") {
+		t.Errorf("systemBrowserHelp() = %q, want it to offer unsetting the override", got)
+	}
+	if strings.Contains(got, "Arch Linux ARM") {
+		t.Errorf("systemBrowserHelp() = %q, want no arm64 install guidance on amd64", got)
+	}
+}
+
+func TestSystemBrowserHelp_WithoutOverrideAsksForAnInstall(t *testing.T) {
+	noBrowserOverride(t)
+	got := systemBrowserHelp()
+	if !strings.Contains(got, "install Chromium") {
+		t.Errorf("systemBrowserHelp() = %q, want install guidance when no override is set", got)
+	}
+	if strings.Contains(got, "unset") {
+		t.Errorf("systemBrowserHelp() = %q, want no unset advice when no override is set", got)
+	}
+}
+
+func TestEnsureBrowser_MissingCDMBlamesTheOverride(t *testing.T) {
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	fakeBrowser(t) // usable browser, no CDM anywhere it looks
+	err := EnsureBrowser(func(string) {})
+	if err == nil {
+		t.Fatal("EnsureBrowser with an override and no Widevine CDM returned nil; want error")
+	}
+	if !strings.Contains(err.Error(), "VIBEZ_CHROME_PATH") {
+		t.Errorf("EnsureBrowser error = %q, want it to name the override in force", err)
+	}
+	if strings.Contains(err.Error(), "Arch Linux ARM") {
+		t.Errorf("EnsureBrowser error = %q, want no arm64 install guidance on amd64", err)
 	}
 }

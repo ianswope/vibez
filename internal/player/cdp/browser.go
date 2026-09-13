@@ -110,10 +110,24 @@ func linkHelper() {
 	_ = os.Link(ChromePath(), HelperPath())
 }
 
-// chromeInstallHelpARM64 guides arm64 users when a browser or Widevine CDM is
-// missing. Google ships no Linux/arm64 Chrome, so vibez relies on a
-// system-installed Chromium plus a system-registered Widevine CDM.
-const chromeInstallHelpARM64 = "install Chromium and a Widevine CDM (e.g. `pacman -S chromium widevine` on Arch Linux ARM, or your distro's equivalent) — or set VIBEZ_CHROME_PATH to a browser binary"
+// systemBrowserHelp guides a user past a missing browser or Widevine CDM on
+// the system-browser path. Which advice applies turns on how vibez got here.
+// An override the user set is theirs to correct or to drop, and telling them
+// to set the variable they already set, or to install a distro Chromium they
+// never asked vibez to use, helps with neither. Dropping the override on amd64
+// returns them to the Google Chrome vibez downloads, which carries its own
+// CDM; arm64 has no such fallback, so there the advice stays "install one".
+func systemBrowserHelp() string {
+	env, _ := browserOverride()
+	switch {
+	case env == "":
+		return "install Chromium and a Widevine CDM (e.g. `pacman -S chromium widevine` on Arch Linux ARM, or your distro's equivalent), or set VIBEZ_CHROME_PATH to a browser binary"
+	case runtime.GOARCH == "amd64":
+		return "point " + env + " at a browser with a Widevine CDM, or unset it to use the Google Chrome vibez downloads, which bundles one"
+	default:
+		return "point " + env + " at a browser with a Widevine CDM, or unset it to let vibez discover a system Chromium (e.g. `pacman -S chromium widevine` on Arch Linux ARM, or your distro's equivalent)"
+	}
+}
 
 // systemBrowserCandidates lists the executables searched on PATH (in order)
 // for the system-browser backend.
@@ -160,14 +174,9 @@ func findSystemBrowser() (string, error) {
 			return p, nil
 		}
 	}
-	return "", fmt.Errorf("no Chromium/Chrome found on PATH; %s", chromeInstallHelpARM64)
+	return "", fmt.Errorf("no Chromium/Chrome found on PATH; %s", systemBrowserHelp())
 }
 
-// widevineCDMDir returns the first directory holding a Widevine CDM for this
-// arch, or "" if none is found. It checks well-known package locations plus the
-// directory next to the discovered browser (where Chromium keeps its CDM).
-// Chromium can also locate a system-registered CDM on its own, so callers may
-// launch without an explicit --widevine-path even when this returns "".
 // widevineSystemDirs are the fixed locations checked for a registered Widevine
 // CDM. Declared as a var so tests can substitute a controlled list.
 var widevineSystemDirs = []string{
@@ -188,6 +197,14 @@ func widevinePlatformDir() string {
 	return "linux_" + runtime.GOARCH
 }
 
+// widevineCDMDir returns the first directory holding a Widevine CDM for this
+// arch, or "" if none is found. It checks well-known package locations plus the
+// directory next to the discovered browser (where Chromium keeps its CDM).
+// "" is not on its own fatal at launch: chromeLaunchArgs omits --widevine-path
+// for it and lets Chromium locate a registered CDM itself. It is fatal
+// earlier, in ensureSystemBrowser, which refuses to start a system browser it
+// could not find a CDM for rather than let playback degrade to previews
+// without saying so.
 func widevineCDMDir() string {
 	candidates := append([]string(nil), widevineSystemDirs...)
 	if home, err := os.UserHomeDir(); err == nil {
@@ -254,7 +271,7 @@ func ensureSystemBrowser(onProgress func(string)) error {
 	}
 	onProgress(fmt.Sprintf("Using system browser: %s", browser))
 	if widevineCDMDir() == "" {
-		return fmt.Errorf("no Widevine CDM found (required for full-track playback); %s", chromeInstallHelpARM64)
+		return fmt.Errorf("no Widevine CDM found (required for full-track playback); %s", systemBrowserHelp())
 	}
 
 	onProgress("Fetching dependencies…")
@@ -316,7 +333,7 @@ func warmUpWidevine(onProgress func(string)) error {
 		}
 		time.Sleep(250 * time.Millisecond)
 	}
-	return fmt.Errorf("timed out waiting for the Widevine CDM to register; %s", chromeInstallHelpARM64)
+	return fmt.Errorf("timed out waiting for the Widevine CDM to register; %s", systemBrowserHelp())
 }
 
 // ensureBrowserAMD64 downloads and extracts Google Chrome into vibez's private
