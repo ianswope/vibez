@@ -72,6 +72,16 @@ archives:
       - goos: windows
         formats:
           - zip
+    # Setting files replaces GoReleaser's default list, so the three it adds on
+    # its own are restated. The desktop file and icon let a distro package
+    # (#53) install everything from this one archive; they are the same two
+    # files the install script and the Flatpak manifest already ship.
+    files:
+      - LICENSE*
+      - README*
+      - CHANGELOG*
+      - flatpak/io.github.simonepelosi.vibez.desktop
+      - assets/logo.png
 
 checksum:
   name_template: "checksums.txt"
