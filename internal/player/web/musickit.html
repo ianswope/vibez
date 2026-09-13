@@ -35,14 +35,32 @@
       // MusicKit derives the correct storefront from the user token automatically.
       const music = await MusicKit.configure(configOpts);
 
-      // Allow explicit content. MusicKit.js enforces content restrictions
-      // client-side; setting this property lifts the app-level filter so
-      // explicit tracks are not blocked before the request even reaches
-      // Apple's servers. Account-level Screen Time / Family Sharing
-      // restrictions are enforced server-side and cannot be overridden here.
-      if ('isExplicitContentAllowed' in music) {
-        try { music.isExplicitContentAllowed = true; } catch(_) {}
-      }
+      // Lift MusicKit's client-side explicit-content filter.
+      //
+      // MusicKit keeps a `restrictedEnabled` flag, and with no stored preference
+      // it guesses one from the storefront country alone: br, ch, gt, hu, id,
+      // in, it, kr, la, lt, my, ru, sg and tr are restricted by default. vibez
+      // drives Chrome with an ephemeral profile, so that storage is empty on
+      // every launch and the guess is made afresh every time. Each setQueue then
+      // copies the flag onto the queue, whose setter drops every explicit item
+      // and raises CONTENT_RESTRICTED once the queue is left empty. vibez reads
+      // that as an unavailable track and skips it without a word, so an explicit
+      // track is unplayable in those storefronts (#130).
+      //
+      // Assigning the property routes to storekit.overrideRestrictEnabled(),
+      // which latches the value so the country guess cannot re-derive it. Apple
+      // still enforces genuine account restrictions server-side; dropping the
+      // guess only stops vibez filtering on a value it cannot confirm and gives
+      // the user no way to change.
+      //
+      // This must run before musicUserToken is set below. Applying the token
+      // calls runTokenValidations, which reads the same flag and would leave
+      // authorizationStatus at RESTRICTED for the storefronts above.
+      //
+      // The property this replaces, `isExplicitContentAllowed`, does not exist
+      // in MusicKit v3. Guarding it with `in` meant the assignment never ran and
+      // nothing was ever lifted.
+      try { music.restrictedEnabled = false; } catch(_) {}
 
       function resolveAudioBitrate(kbps) {
         const n = Number(kbps);
@@ -832,7 +850,7 @@
       if (savedToken !== '') {
         const sf = music.storefrontId || '(unknown)';
         await goStorefrontChanged(sf).catch(() => {});
-        await goLog(`[init] storefront=${sf} configured={{.Storefront}} musickit=${MusicKit.version||'?'} token=saved`).catch(() => {});
+        await goLog(`[init] storefront=${sf} configured={{.Storefront}} musickit=${MusicKit.version||'?'} restricted=${music.restrictedEnabled} token=saved`).catch(() => {});
         await goAuthComplete('done').catch(() => {});
       } else {
         // No saved token: need interactive auth (Chrome window is visible).
@@ -842,7 +860,7 @@
           await goUserTokenChanged(token || '').catch(() => {});
           const sf = music.storefrontId || '(unknown)';
           await goStorefrontChanged(sf).catch(() => {});
-          await goLog(`[init] storefront=${sf} configured={{.Storefront}} musickit=${MusicKit.version||'?'} token=new`).catch(() => {});
+          await goLog(`[init] storefront=${sf} configured={{.Storefront}} musickit=${MusicKit.version||'?'} restricted=${music.restrictedEnabled} token=new`).catch(() => {});
           await goAuthComplete('done').catch(() => {});
         } catch(e) {
           goError('auth failed: ' + (e.message || String(e))).catch(() => {});
