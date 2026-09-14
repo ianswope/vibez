@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [Unreleased]
+
+### Fixed
+- **MPRIS metadata could crash vibez or corrupt a reply mid-track-change**: godbus's `prop.Export` keeps one allocation per property and merges every update into it with `dbus.Store`, which for the `a{sv}` Metadata property is an in-place `storeMapIntoMap` rather than a replacement. It then handed that live map to the encoder both from `emitChange` and, less visibly, from `Get` and `GetAll`, which release the lock before the reply is encoded in the connection's output goroutine. Any MPRIS client polling `GetAll` during a track change therefore read the map while `flush` wrote it, with no `PropertiesChanged` involved. Go detects that on its own and aborts the process with `fatal error: concurrent map read and map write`, which no `recover` can catch. Both interfaces now use a Properties implementation in the package: `GetAll` builds a fresh map per call, Metadata is replaced wholesale instead of merged, and nothing is written after it escapes. `flush` also emits one batched `PropertiesChanged` rather than the 6 to 8 a single track change used to produce, and `Position` is no longer announced there, matching the spec's `EmitsChangedSignal=false` and the existing `Seeked` signal. Closes #110.
+
 ## [0.8.0] — 2026-09-14
 
 ### Added
