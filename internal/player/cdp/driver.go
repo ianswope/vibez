@@ -11,9 +11,8 @@ import (
 )
 
 func isDriverUpToDate() bool {
-	driver, err := playwright.NewDriver(&playwright.RunOptions{
-		DriverDirectory: driverDir(),
-	})
+	opts, _ := newDriverRunOptions(driverDir())
+	driver, err := playwright.NewDriver(opts)
 	if err != nil {
 		return false
 	}
@@ -39,11 +38,9 @@ func installPlaywrightDriver() error {
 		return err
 	}
 	_ = os.Setenv("PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS", "1")
-	if err := playwright.Install(&playwright.RunOptions{
-		DriverDirectory:     driverDir(),
-		SkipInstallBrowsers: true,
-	}); err != nil {
-		return fmt.Errorf("playwright driver: %w", err)
+	opts, output := newDriverRunOptions(driverDir())
+	if err := playwright.Install(opts); err != nil {
+		return addDriverOutput(fmt.Errorf("playwright driver: %w", err), output)
 	}
 	return nil
 }
