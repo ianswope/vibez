@@ -21,7 +21,6 @@ import (
 	"time"
 
 	"github.com/godbus/dbus/v5"
-	"github.com/godbus/dbus/v5/prop"
 
 	"github.com/simone-vibes/vibez/internal/assets"
 	"github.com/simone-vibes/vibez/internal/player"
@@ -50,7 +49,7 @@ type Controller interface {
 // Server is the MPRIS D-Bus server for vibez. Create with NewServer.
 type Server struct {
 	conn  *dbus.Conn
-	props *prop.Properties
+	props *properties
 
 	mu                   sync.Mutex
 	flushMu              sync.Mutex
@@ -127,7 +126,7 @@ func (p *playerObj) Stop() *dbus.Error     { _ = p.ctrl.Pause(); return nil }
 func (p *playerObj) Play() *dbus.Error     { _ = p.ctrl.Play(); return nil }
 
 func (p *playerObj) PlayPause() *dbus.Error {
-	status, _ := p.srv.props.GetMust(mprisPlayerIface, "PlaybackStatus").(string)
+	status, _ := p.srv.props.get(mprisPlayerIface, "PlaybackStatus").(string)
 	if status == "Playing" {
 		return p.Pause()
 	}
@@ -212,24 +211,24 @@ func NewServer(ctrl Controller) (*Server, error) {
 	emptyMeta := map[string]dbus.Variant{
 		"mpris:trackid": dbus.MakeVariant(noTrackPath),
 	}
-	propsSpec := prop.Map{
+	ro := func(v any) *propSpec { return &propSpec{value: dbus.MakeVariant(v)} }
+	propsSpec := map[string]map[string]*propSpec{
 		mprisRootIface: {
-			"CanQuit":             {Value: false, Writable: false, Emit: prop.EmitFalse},
-			"CanRaise":            {Value: false, Writable: false, Emit: prop.EmitFalse},
-			"HasTrackList":        {Value: false, Writable: false, Emit: prop.EmitFalse},
-			"Identity":            {Value: "vibez", Writable: false, Emit: prop.EmitFalse},
-			"DesktopEntry":        {Value: assets.AppID, Writable: false, Emit: prop.EmitFalse},
-			"SupportedUriSchemes": {Value: []string{}, Writable: false, Emit: prop.EmitFalse},
-			"SupportedMimeTypes":  {Value: []string{}, Writable: false, Emit: prop.EmitFalse},
+			"CanQuit":             ro(false),
+			"CanRaise":            ro(false),
+			"HasTrackList":        ro(false),
+			"Identity":            ro("vibez"),
+			"DesktopEntry":        ro(assets.AppID),
+			"SupportedUriSchemes": ro([]string{}),
+			"SupportedMimeTypes":  ro([]string{}),
 		},
 		mprisPlayerIface: {
-			"PlaybackStatus": {Value: "Stopped", Writable: false, Emit: prop.EmitTrue},
+			"PlaybackStatus": ro("Stopped"),
 			"LoopStatus": {
-				Value:    "None",
-				Writable: true,
-				Emit:     prop.EmitTrue,
-				Callback: func(c *prop.Change) *dbus.Error {
-					ls, _ := c.Value.(string)
+				value:    dbus.MakeVariant("None"),
+				writable: true,
+				onSet: func(v dbus.Variant) *dbus.Error {
+					ls, _ := v.Value().(string)
 					mode := player.RepeatModeOff
 					switch ls {
 					case "Track":
@@ -241,31 +240,30 @@ func NewServer(ctrl Controller) (*Server, error) {
 					return nil
 				},
 			},
-			"Rate": {Value: float64(1), Writable: false, Emit: prop.EmitFalse},
+			"Rate": ro(float64(1)),
 			"Shuffle": {
-				Value:    false,
-				Writable: true,
-				Emit:     prop.EmitTrue,
-				Callback: func(c *prop.Change) *dbus.Error {
-					on, _ := c.Value.(bool)
+				value:    dbus.MakeVariant(false),
+				writable: true,
+				onSet: func(v dbus.Variant) *dbus.Error {
+					on, _ := v.Value().(bool)
 					_ = ctrl.SetShuffle(on)
 					return nil
 				},
 			},
-			"Metadata":      {Value: emptyMeta, Writable: false, Emit: prop.EmitTrue},
-			"Volume":        {Value: float64(1), Writable: false, Emit: prop.EmitTrue},
-			"Position":      {Value: int64(0), Writable: false, Emit: prop.EmitInvalidates},
-			"MinimumRate":   {Value: float64(1), Writable: false, Emit: prop.EmitFalse},
-			"MaximumRate":   {Value: float64(1), Writable: false, Emit: prop.EmitFalse},
-			"CanGoNext":     {Value: true, Writable: false, Emit: prop.EmitTrue},
-			"CanGoPrevious": {Value: true, Writable: false, Emit: prop.EmitTrue},
-			"CanPlay":       {Value: true, Writable: false, Emit: prop.EmitTrue},
-			"CanPause":      {Value: true, Writable: false, Emit: prop.EmitTrue},
-			"CanSeek":       {Value: true, Writable: false, Emit: prop.EmitTrue},
-			"CanControl":    {Value: true, Writable: false, Emit: prop.EmitFalse},
+			"Metadata":      ro(emptyMeta),
+			"Volume":        ro(float64(1)),
+			"Position":      ro(int64(0)),
+			"MinimumRate":   ro(float64(1)),
+			"MaximumRate":   ro(float64(1)),
+			"CanGoNext":     ro(true),
+			"CanGoPrevious": ro(true),
+			"CanPlay":       ro(true),
+			"CanPause":      ro(true),
+			"CanSeek":       ro(true),
+			"CanControl":    ro(true),
 		},
 	}
-	props, err := prop.Export(conn, mprisObjectPath, propsSpec)
+	props, err := newProperties(conn, mprisObjectPath, propsSpec)
 	if err != nil {
 		_ = conn.Close()
 		return nil, fmt.Errorf("mpris: export props: %w", err)
@@ -337,16 +335,19 @@ func isSeek(playing bool, lastPos time.Duration, lastAt time.Time, newPos time.D
 	return delta > seekThreshold
 }
 
-// trySetProperty contains godbus's panic-on-error API. MPRIS is optional, so
-// malformed provider metadata or a lost session bus must not terminate vibez.
-func (s *Server) trySetProperty(name string, value any) (ok bool) {
-	defer func() {
-		if recover() != nil {
-			s.markUnavailable()
-			ok = false
-		}
-	}()
-	s.props.SetMust(mprisPlayerIface, name, value)
+// setProperty records a Player property locally. Nothing is emitted here; the
+// caller batches every change of one update into a single PropertiesChanged.
+func (s *Server) setProperty(name string, value any) {
+	s.props.store(mprisPlayerIface, name, value)
+}
+
+// emitChanged publishes one batched PropertiesChanged. MPRIS is optional, so a
+// lost session bus marks the server unavailable rather than terminating vibez.
+func (s *Server) emitChanged(changed map[string]dbus.Variant) bool {
+	if err := s.props.emitChanged(mprisPlayerIface, changed); err != nil {
+		s.markUnavailable()
+		return false
+	}
 	return true
 }
 
@@ -403,9 +404,7 @@ func (s *Server) flush() {
 	// Seeked signal (the Position property does not emit PropertiesChanged).
 	// Refresh Position first so a client reading it in response gets the new value.
 	if seeked {
-		if !s.trySetProperty("Position", st.Position.Microseconds()) {
-			return
-		}
+		s.setProperty("Position", st.Position.Microseconds())
 		if err := s.conn.Emit(mprisObjectPath, mprisPlayerIface+".Seeked", st.Position.Microseconds()); err != nil {
 			s.markUnavailable()
 			return
@@ -415,12 +414,11 @@ func (s *Server) flush() {
 		}
 	}
 
-	// Every key is written on every update, including empty ones. godbus merges
-	// into the map it already holds (dbus.Store -> storeMapIntoMap) rather than
-	// replacing it, so a key we omit keeps the previous track's value instead of
-	// disappearing: a track without artwork would still advertise the last
-	// track's mpris:artUrl. Removing keys properly needs the export change in
-	// #110; until then a constant key set is what keeps metadata truthful.
+	// Built fresh on every update and never written afterwards. The store
+	// replaces the whole map rather than merging into it, so a key omitted here
+	// disappears instead of keeping the previous track's value, and the map
+	// handed to the encoder is immutable from that point on. Writing the full
+	// key set is still what keeps metadata truthful for clients that cache it.
 	meta := map[string]dbus.Variant{
 		"mpris:trackid": dbus.MakeVariant(noTrackPath),
 		"mpris:length":  dbus.MakeVariant(int64(0)),
@@ -438,19 +436,6 @@ func (s *Server) flush() {
 		meta["xesam:album"] = dbus.MakeVariant(t.Album)
 	}
 
-	if !s.trySetProperty("PlaybackStatus", status) {
-		return
-	}
-	if !s.trySetProperty("Metadata", meta) {
-		return
-	}
-	if !s.trySetProperty("Position", st.Position.Microseconds()) {
-		return
-	}
-	if st.Volume > 0 && !s.trySetProperty("Volume", st.Volume) {
-		return
-	}
-
 	loopStatus := "None"
 	switch st.RepeatMode {
 	case player.RepeatModeOne:
@@ -458,10 +443,26 @@ func (s *Server) flush() {
 	case player.RepeatModeAll:
 		loopStatus = "Playlist"
 	}
-	if !s.trySetProperty("LoopStatus", loopStatus) {
-		return
+
+	changed := map[string]dbus.Variant{
+		"PlaybackStatus": dbus.MakeVariant(status),
+		"Metadata":       dbus.MakeVariant(meta),
+		"LoopStatus":     dbus.MakeVariant(loopStatus),
+		"Shuffle":        dbus.MakeVariant(st.ShuffleMode),
 	}
-	_ = s.trySetProperty("Shuffle", st.ShuffleMode)
+	if st.Volume > 0 {
+		changed["Volume"] = dbus.MakeVariant(st.Volume)
+	}
+	for name, v := range changed {
+		s.setProperty(name, v.Value())
+	}
+
+	// Position is deliberately absent from the signal. The MPRIS spec marks it
+	// EmitsChangedSignal=false and announces discontinuous jumps with Seeked
+	// instead, which is handled above; a client extrapolates the rest.
+	s.setProperty("Position", st.Position.Microseconds())
+
+	s.emitChanged(changed)
 }
 
 // Close releases the session bus connection.

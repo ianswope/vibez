@@ -4,6 +4,7 @@ package mpris
 
 import (
 	"slices"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -814,7 +815,7 @@ func TestServer_Update_TrackWithoutID(t *testing.T) {
 	srv.Update(player.State{Playing: true, Track: track})
 	srv.flush()
 
-	metadata, ok := srv.props.GetMust(mprisPlayerIface, "Metadata").(map[string]dbus.Variant)
+	metadata, ok := srv.props.get(mprisPlayerIface, "Metadata").(map[string]dbus.Variant)
 	if !ok {
 		t.Fatal("Metadata property has unexpected type")
 	}
@@ -887,7 +888,7 @@ func TestServer_Update_DistinguishesCollidingTrackIDs(t *testing.T) {
 	srv.Update(player.State{Playing: true, Track: second})
 	srv.flush()
 
-	metadata, ok := srv.props.GetMust(mprisPlayerIface, "Metadata").(map[string]dbus.Variant)
+	metadata, ok := srv.props.get(mprisPlayerIface, "Metadata").(map[string]dbus.Variant)
 	if !ok {
 		t.Fatal("Metadata property has unexpected type")
 	}
@@ -936,7 +937,7 @@ func TestServer_UpdateAfterBusLossDoesNotPanic(t *testing.T) {
 
 func currentMetadata(t *testing.T, srv *Server) map[string]dbus.Variant {
 	t.Helper()
-	meta, ok := srv.props.GetMust(mprisPlayerIface, "Metadata").(map[string]dbus.Variant)
+	meta, ok := srv.props.get(mprisPlayerIface, "Metadata").(map[string]dbus.Variant)
 	if !ok {
 		t.Fatal("Metadata property is not a map[string]dbus.Variant")
 	}
@@ -1021,4 +1022,61 @@ func TestServer_Update_ClearsMetadataWhenTrackGoesAway(t *testing.T) {
 	if got, ok := meta["xesam:artist"].Value().([]string); !ok || len(got) != 0 {
 		t.Errorf("xesam:artist = %v, want empty once no track is playing", meta["xesam:artist"].Value())
 	}
+}
+
+// Regression test for #110, meaningful only under -race.
+//
+// A client calling GetAll while a track change was in flight raced godbus's
+// retained Metadata map: prop.GetAll handed back the very map dbus.Store was
+// merging the next update into, and the reply was encoded in the connection's
+// output goroutine after GetAll had already released the lock. Emit settings
+// could not fix that leg, because no PropertiesChanged was involved.
+func TestServer_GetAllDuringFlushIsRaceFree(t *testing.T) {
+	ctrl := &mockController{}
+	srv, err := NewServer(ctrl)
+	if err != nil {
+		t.Skipf("NewServer failed: %v", err)
+	}
+	defer srv.Close() //nolint:errcheck
+
+	client, err := dbus.ConnectSessionBus()
+	if err != nil {
+		t.Skip("D-Bus unavailable:", err)
+	}
+	defer client.Close() //nolint:errcheck
+	obj := client.Object(mprisServiceName, mprisObjectPath)
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			var all map[string]dbus.Variant
+			if err := obj.Call(propertiesIface+".GetAll", 0, mprisPlayerIface).Store(&all); err != nil {
+				continue
+			}
+			// Touch the metadata map so a racing write is actually observed
+			// rather than sitting undetected in the reply body.
+			if meta, ok := all["Metadata"].Value().(map[string]dbus.Variant); ok {
+				for k := range meta {
+					_ = k
+				}
+			}
+		}
+	})
+
+	for i := range 60 {
+		srv.Update(player.State{
+			Playing:  true,
+			Track:    &provider.Track{ID: strconv.Itoa(i), Title: "T" + strconv.Itoa(i), Artist: "A", Duration: time.Minute},
+			Position: time.Duration(i) * time.Second,
+		})
+		srv.flush()
+	}
+	close(stop)
+	wg.Wait()
 }
