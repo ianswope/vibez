@@ -7,10 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [Unreleased]
+## [0.9.0] — 2026-09-14
+
+### Added
+- **Local tracks playback without an Apple Music account (`--local`, `--music-dir`)** — play audio files directly from your filesystem (MP3, FLAC, M4A on all platforms; OGG on Linux via GStreamer). Tracks are scanned recursively, metadata (title, artist, album, genre) is parsed using ID3/tag readers, and tracks are surfaced in the Library and Discovery panels (grouped by genre). Audio playback uses CoreAudio via CGO on macOS and GStreamer on Linux. Works completely offline with no Apple developer credentials, DRM, or browser needed. Closes #61, refs #62.
 
 ### Fixed
-- **MPRIS metadata could crash vibez or corrupt a reply mid-track-change**: godbus's `prop.Export` keeps one allocation per property and merges every update into it with `dbus.Store`, which for the `a{sv}` Metadata property is an in-place `storeMapIntoMap` rather than a replacement. It then handed that live map to the encoder both from `emitChange` and, less visibly, from `Get` and `GetAll`, which release the lock before the reply is encoded in the connection's output goroutine. Any MPRIS client polling `GetAll` during a track change therefore read the map while `flush` wrote it, with no `PropertiesChanged` involved. Go detects that on its own and aborts the process with `fatal error: concurrent map read and map write`, which no `recover` can catch. Both interfaces now use a Properties implementation in the package: `GetAll` builds a fresh map per call, Metadata is replaced wholesale instead of merged, and nothing is written after it escapes. `flush` also emits one batched `PropertiesChanged` rather than the 6 to 8 a single track change used to produce, and `Position` is no longer announced there, matching the spec's `EmitsChangedSignal=false` and the existing `Seeked` signal. Closes #110.
+- **MPRIS metadata could crash vibez or corrupt a reply mid-track-change** — godbus's `prop.Export` keeps one allocation per property and merges every update into it with `dbus.Store`, which for the `a{sv}` Metadata property is an in-place `storeMapIntoMap` rather than a replacement. It then handed that live map to the encoder both from `emitChange` and, less visibly, from `Get` and `GetAll`, which release the lock before the reply is encoded in the connection's output goroutine. Any MPRIS client polling `GetAll` during a track change therefore read the map while `flush` wrote it, with no `PropertiesChanged` involved. Go detects that on its own and aborts the process with `fatal error: concurrent map read and map write`, which no `recover` can catch. Both interfaces now use a Properties implementation in the package: `GetAll` builds a fresh map per call, Metadata is replaced wholesale instead of merged, and nothing is written after it escapes. `flush` also emits one batched `PropertiesChanged` rather than the 6 to 8 a single track change used to produce, and `Position` is no longer announced there, matching the spec's `EmitsChangedSignal=false` and the existing `Seeked` signal. Closes #110, refs #133.
+
+### Thanks
+- Thanks to @GurKalra for implementing local tracks playback.
+- Thanks to @ianswope for benchmarking and testing the CoreAudio backend and implementing the race-free MPRIS Properties export.
 
 ## [0.8.0] — 2026-09-14
 
@@ -646,7 +653,8 @@ First public pre-release of vibez.
 
 ---
 
-[Unreleased]: https://github.com/simonepelosi/vibez/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/simonepelosi/vibez/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/simonepelosi/vibez/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/simonepelosi/vibez/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/simonepelosi/vibez/compare/v0.6.1...v0.7.0
 [0.6.1]: https://github.com/simonepelosi/vibez/compare/v0.6.0...v0.6.1
