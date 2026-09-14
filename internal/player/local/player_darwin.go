@@ -53,6 +53,7 @@ static void vibez_audio_callback(void *ctx, AudioQueueRef queue, AudioQueueBuffe
 	if(s->done) return;
 	if(vibez_fill_buffer(s, buf)) {
 		s->done = 1;
+		s->playing = 0;
 		AudioQueueStop(queue, false);
 		vibezOnEOS((uintptr_t)s->goPlayer);
 		return;

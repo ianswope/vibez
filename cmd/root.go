@@ -118,14 +118,6 @@ func runTUI(_ *cobra.Command, _ []string) error {
 			return fmt.Errorf("loading local tracks: %w", err)
 		}
 		plyr.LoadTracks(tracks)
-		// Auto-play from the first track on launch.
-		if len(tracks) > 0 {
-			ids := make([]string, len(tracks))
-			for i, t := range tracks {
-				ids[i] = t.ID
-			}
-			_ = plyr.SetQueue(ids)
-		}
 		opts.IconPath = iconPath
 		opts.InitialTracks = tracks
 		opts.Backend = "Local mode · playing from " + cfg.MusicDir
