@@ -7,16 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [Unreleased]
+## [0.8.0] — 2026-09-14
+
+### Added
+- **Native MusicKit queue advancement for seamless transitions** — catalog queues are now built once with `setQueue({items:[...]})` and MusicKit advances the queue natively rather than rebuilding it track-by-track. Mid-session insertions go through `playNext`/`playLater`, and `next`/`prev` delegate to `skipToNextItem`/`skipToPreviousItem`. Resolving library descriptors allows mixed queues, dropping the track transition gap from ~700 ms to ~20 ms. Refs #96, #124.
+- **`VIBEZ_CHROME_PATH` support on Linux amd64** — users can now point `VIBEZ_CHROME_PATH` (or `CHROME_PATH`) to a system browser binary on x86_64, using a persistent profile and local Widevine CDM lookup without downloading Chrome. Tailored error diagnostics guide users on arch-specific Widevine requirements. Refs #53, #129.
+- **Desktop file and icon bundled in release archives** — GoReleaser archives now include `flatpak/io.github.simonepelosi.vibez.desktop` and `assets/logo.png` to streamline third-party distribution packaging (such as the Arch Linux AUR). Refs #53, #127.
 
 ### Fixed
-- **Discovery mode and vibe search returned little or nothing**: catalog song search went to `amp-api.music.apple.com`, an undocumented web-player endpoint, which has been rejecting developer/user token pairs that the supported endpoints accept. #118 added a retry against `api.music.apple.com`, but the rejection still had to happen first, and until it did the songs leg contributed nothing. Since a failing songs leg is not fatal to `Search`, discovery was left refilling from the user's library alone, which is why it returned unrelated tracks for users who had the artist and an empty queue for users who did not. Catalog search now goes straight to `api.music.apple.com`, the host albums and playlists already use. That endpoint does not return `extendedAssetUrls`, so the stream-availability filter is gone and playback is the final authority on storefront availability, matching how catalog album and playlist tracks have been queued since #82. Closes #93.
+- **Discovery mode and vibe search returned 0 tracks** — catalog song search moved from the 401-prone `amp-api.music.apple.com` to the official `api.music.apple.com/v1/catalog/{storefront}/search` endpoint. Playability filtering now checks `PlayParams != nil && Kind == "song"`, matching album and playlist tracks, while partial search failures surface as warnings instead of silently producing empty results. Closes #93, refs #132.
+- **Explicit tracks failed to play across international storefronts** — MusicKit's implicit client-side restriction on clean browser profiles caused explicit tracks to be stripped with `CONTENT_RESTRICTED`. Vibez now clears MusicKit's restriction flag on initialization so explicit catalog items play consistently. Refs #125, #130, #131.
+- **Duplicate now-playing indicators in the queue panel** — the queue marker now tracks the playing track by playback ID rather than comparing title strings, preventing duplicate `▶` markers when an album or title appears multiple times. Refs #122, #123.
+- **Desktop entry ID mismatch for MPRIS** — the embedded desktop file is now installed under `io.github.simonepelosi.vibez.desktop` to match the MPRIS `DesktopEntry` property. Existing entries from system packages or install scripts are left untouched. Refs #53, #128.
+- **Debug log entries dropped during fast startup** — the debug logger now delivers every log entry rather than dropping messages that exceed the initial channel capacity, preventing lost diagnostics during startup and playback transitions. Refs #126.
 
-### Changed
-- **Track transitions no longer rebuild MusicKit's queue**: vibez called `setQueue({songs:[one id]})` at every track boundary, so each transition paid a round trip that landed exactly where the gap is audible. The queue is now built once with `setQueue({items:[...]})` and MusicKit advances it, with `next`/`prev` delegating to `skipToNextItem`/`skipToPreviousItem` and insertions going through `playNext`/`playLater`. `items:` takes resolved descriptors of either kind, so a library song no longer forces the whole queue back to per-track rebuilds. Measured over a two-item queue the boundary gap went from a 700 ms median to 23.7 ms, though the figure moves with queue length and the shipped shape has not been swept yet. Refs #96.
-
-### Fixed
-- **Now-playing marker appeared on every queue row sharing the playing track's title**: the queue panel chose the `▶` marker with a title string comparison, so a queue holding the same song twice, or two different songs that happen to share a name, marked every match rather than the position actually playing. The marker now follows the playing track's position, located by playback ID the way `dropQueueAfter` locates its seed, with title kept only as a last resort so the marker survives the library fallback swapping a catalog entry for its library copy. Refs #122.
+### Thanks
+- Thanks to @ianswope for native MusicKit queue advancement, catalog search migration, amd64 browser override, release packaging assets, MPRIS desktop entry alignment, explicit playback fixes, and queue marker fixes.
 
 ## [0.7.0] — 2026-08-29
 
@@ -635,7 +641,8 @@ First public pre-release of vibez.
 
 ---
 
-[Unreleased]: https://github.com/simonepelosi/vibez/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/simonepelosi/vibez/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/simonepelosi/vibez/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/simonepelosi/vibez/compare/v0.6.1...v0.7.0
 [0.6.1]: https://github.com/simonepelosi/vibez/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/simonepelosi/vibez/compare/v0.5.0...v0.6.0
