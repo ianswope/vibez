@@ -9,9 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.1] — 2026-09-15
+
 ### Fixed
-- **Release binaries terminated abruptly without error traces**: `scripts/garble-go` passed `-tiny` to `garble`, which strips the Go runtime panic printer and causes sudden, silent process exits (exit code 2) without error logs or traceback. GoReleaser now builds with `garble -literals` (matching `make release`), preserving string obfuscation for embedded developer tokens while restoring standard runtime error reporting and binary stability. Refs #88.
-- **A Playwright driver that failed to start said nothing about why**: `driverStderr()` returned `io.Discard`, so the driver's stderr went nowhere. Handing node a pipe rather than an `*os.File` is required, because `os/exec` passes a file descriptor straight through to the child and the driver's exit handler then restores a termios snapshot taken before BubbleTea switched the terminal to raw mode, leaving the shell with no echo or line editing after vibez quits. Discarding the output achieved that and cost the only account of a failed start. The driver now writes to a bounded 64 KiB buffer that is still a plain `io.Writer`, and its tail is attached to the error when startup or install fails. Every Playwright entry point in the package builds its options through one constructor, so a call site that misses `Stdout`, `Stderr` or `Logger` fails a test rather than silently handing the driver a terminal. Refs #103.
+- **Release binaries terminated abruptly without error traces** — `scripts/garble-go` passed `-tiny` to `garble`, which strips the Go runtime panic printer and causes sudden, silent process exits (exit code 2) without error logs or traceback. GoReleaser now builds with `garble -literals` (matching `make release`), preserving string obfuscation for embedded developer tokens while restoring standard runtime error reporting and binary stability. Refs #88, #136.
+- **A Playwright driver that failed to start said nothing about why** — `driverStderr()` returned `io.Discard`, so the driver's stderr went nowhere. The driver now writes to a bounded 64 KiB buffer that is still a plain `io.Writer`, and its tail is attached to the error when startup or install fails. Every Playwright entry point in the package builds its options through one constructor, so a call site that misses `Stdout`, `Stderr` or `Logger` fails a test rather than silently handing the driver a terminal. Refs #103, #135.
+- **Desktop logo resized to 512x512 for packaging compatibility** — `assets/logo.png` is now exactly 512x512 pixels, matching standard XDG hicolor icon directory dimensions and preventing packaging linter warnings in Flatpak and AUR. Refs #53, #137.
+
 
 ## [0.9.0] — 2026-09-14
 
@@ -659,7 +663,8 @@ First public pre-release of vibez.
 
 ---
 
-[Unreleased]: https://github.com/simonepelosi/vibez/compare/v0.9.0...HEAD
+[Unreleased]: https://github.com/simonepelosi/vibez/compare/v0.9.1...HEAD
+[0.9.1]: https://github.com/simonepelosi/vibez/compare/v0.9.0...v0.9.1
 [0.9.0]: https://github.com/simonepelosi/vibez/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/simonepelosi/vibez/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/simonepelosi/vibez/compare/v0.6.1...v0.7.0
