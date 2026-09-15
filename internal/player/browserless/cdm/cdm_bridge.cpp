@@ -286,6 +286,10 @@ int cdm_context_decrypt(
     input.iv = iv;
     input.iv_size = iv_size;
 
+    cdm::SubsampleEntry default_subsample = {0, in_size};
+    input.subsamples = &default_subsample;
+    input.num_subsamples = 1;
+
     DecryptedBlockImpl output;
     cdm::Status status = ctx->cdm11->Decrypt(input, &output);
     if (status != cdm::kSuccess) {
