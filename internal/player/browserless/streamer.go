@@ -69,7 +69,8 @@ func NewStreamServer(cdmEngine *cdm.CDM, licClient *license.Client) (*StreamServ
 	mux.HandleFunc("/stream/", s.handleStream)
 
 	s.server = &http.Server{
-		Handler: mux,
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
 	}
 
 	go func() {
@@ -113,7 +114,7 @@ func (s *StreamServer) PrepareTrack(ctx context.Context, trackID string) (string
 	if err != nil {
 		return "", 0, fmt.Errorf("fetch playlist: %w", err)
 	}
-	defer hlsResp.Body.Close()
+	defer func() { _ = hlsResp.Body.Close() }()
 
 	playlistBytes, err := io.ReadAll(hlsResp.Body)
 	if err != nil {
@@ -130,33 +131,30 @@ func (s *StreamServer) PrepareTrack(ctx context.Context, trackID string) (string
 
 	for i := 0; i < len(lines); i++ {
 		line := strings.TrimSpace(lines[i])
-		if strings.HasPrefix(line, "#EXT-X-KEY:") {
-			if idx := strings.Index(line, "URI=\""); idx != -1 {
-				rest := line[idx+5:]
-				if endIdx := strings.Index(rest, "\""); endIdx != -1 {
-					keyURI = rest[:endIdx]
+		switch {
+		case strings.HasPrefix(line, "#EXT-X-KEY:"):
+			if _, rest, ok := strings.Cut(line, "URI=\""); ok {
+				if uri, _, ok := strings.Cut(rest, "\""); ok {
+					keyURI = uri
 				}
 			}
-		} else if strings.HasPrefix(line, "#EXT-X-MAP:") {
-			if uIdx := strings.Index(line, "URI=\""); uIdx != -1 {
-				rest := line[uIdx+5:]
-				if endIdx := strings.Index(rest, "\""); endIdx != -1 {
-					initURI = rest[:endIdx]
+		case strings.HasPrefix(line, "#EXT-X-MAP:"):
+			if _, rest, ok := strings.Cut(line, "URI=\""); ok {
+				if uri, _, ok := strings.Cut(rest, "\""); ok {
+					initURI = uri
 				}
 			}
-			if bIdx := strings.Index(line, "BYTERANGE=\""); bIdx != -1 {
-				rest := line[bIdx+11:]
-				if endIdx := strings.Index(rest, "\""); endIdx != -1 {
-					_, _ = fmt.Sscanf(rest[:endIdx], "%d@%d", &initLength, &initOffset)
+			if _, rest, ok := strings.Cut(line, "BYTERANGE=\""); ok {
+				if rangeStr, _, ok := strings.Cut(rest, "\""); ok {
+					_, _ = fmt.Sscanf(rangeStr, "%d@%d", &initLength, &initOffset)
 				}
 			}
-		} else if strings.HasPrefix(line, "#EXTINF:") {
-			parts := strings.Split(strings.TrimPrefix(line, "#EXTINF:"), ",")
-			if len(parts) > 0 {
-				dur, _ := strconv.ParseFloat(strings.TrimSpace(parts[0]), 64)
+		case strings.HasPrefix(line, "#EXTINF:"):
+			if val, _, ok := strings.Cut(strings.TrimPrefix(line, "#EXTINF:"), ","); ok {
+				dur, _ := strconv.ParseFloat(strings.TrimSpace(val), 64)
 				currDuration = dur
 			}
-		} else if strings.HasPrefix(line, "#EXT-X-BYTERANGE:") {
+		case strings.HasPrefix(line, "#EXT-X-BYTERANGE:"):
 			var l, o int64
 			_, _ = fmt.Sscanf(strings.TrimPrefix(line, "#EXT-X-BYTERANGE:"), "%d@%d", &l, &o)
 			for i+1 < len(lines) && strings.HasPrefix(strings.TrimSpace(lines[i+1]), "#") {
@@ -172,8 +170,7 @@ func (s *StreamServer) PrepareTrack(ctx context.Context, trackID string) (string
 					duration: currDuration,
 				})
 			}
-		} else if !strings.HasPrefix(line, "#") && line != "" {
-			// Plain segment URI without byterange
+		case !strings.HasPrefix(line, "#") && line != "":
 			segments = append(segments, segmentRef{
 				uri:      line,
 				duration: currDuration,
@@ -218,7 +215,7 @@ func (s *StreamServer) PrepareTrack(ctx context.Context, trackID string) (string
 		}
 		if resp, err := http.DefaultClient.Do(req); err == nil {
 			initBytes, _ = io.ReadAll(resp.Body)
-			resp.Body.Close()
+			_ = resp.Body.Close()
 		}
 	}
 	audioCfg, _ := mp4.ParseAudioConfig(initBytes)
@@ -316,7 +313,7 @@ func (s *StreamServer) handleStream(w http.ResponseWriter, r *http.Request) {
 		}
 
 		segData, err := io.ReadAll(resp.Body)
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		if err != nil {
 			return
 		}

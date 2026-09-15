@@ -48,7 +48,7 @@ func EnsureCDM() (string, error) {
 	}
 
 	dest := DefaultCDMPath()
-	if err := os.MkdirAll(filepath.Dir(dest), 0755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(dest), 0750); err != nil {
 		return "", fmt.Errorf("failed to create cdm cache directory: %w", err)
 	}
 
@@ -57,8 +57,8 @@ func EnsureCDM() (string, error) {
 	cfgPath := filepath.Join(home, ".config", "vibez", "libwidevinecdm.so")
 	if fi, err := os.Stat(cfgPath); err == nil && !fi.IsDir() && fi.Size() > 100000 {
 		// Copy to cache
-		if data, err := os.ReadFile(cfgPath); err == nil {
-			_ = os.WriteFile(dest, data, 0755)
+		if data, err := os.ReadFile(cfgPath); err == nil { //nolint:gosec // G304: user config path in home dir
+			_ = os.WriteFile(dest, data, 0600) //nolint:gosec // G703: fixed destination path inside user cache
 			return dest, nil
 		}
 	}

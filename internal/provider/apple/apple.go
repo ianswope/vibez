@@ -1467,4 +1467,3 @@ func (a *AppleProvider) GetCatalogTracks(ctx context.Context, ids []string) ([]p
 	}
 	return tracks, nil
 }
-

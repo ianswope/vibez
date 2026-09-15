@@ -31,10 +31,7 @@ func ParseAudioConfig(initData []byte) (AudioConfig, error) {
 	}
 
 	// Scan for tag 0x05 (DecSpecificInfoTag) within esds box
-	boxEnd := len(initData)
-	if esdsIdx+128 < boxEnd {
-		boxEnd = esdsIdx + 128
-	}
+	boxEnd := min(len(initData), esdsIdx+128)
 	esdsData := initData[esdsIdx:boxEnd]
 	tag5Idx := bytes.Index(esdsData, []byte{0x05})
 	if tag5Idx != -1 && tag5Idx+5 < len(esdsData) {
@@ -57,6 +54,8 @@ func ParseAudioConfig(initData []byte) (AudioConfig, error) {
 }
 
 // MakeADTSHeader generates a 7-byte ADTS header for an AAC frame.
+//
+//nolint:gosec // G115: bitwise masked values fit safely in byte
 func MakeADTSHeader(sampleLen int, cfg AudioConfig) []byte {
 	profile := cfg.ObjectType - 1
 	if profile < 0 {
@@ -123,7 +122,7 @@ func DecryptSegment(
 	offset := sencStart + 16
 	ivSize := 8 // Default for Apple Music CENC
 
-	for i := uint32(0); i < sampleCount; i++ {
+	for i := range sampleCount {
 		if offset+ivSize > len(moofData) {
 			return nil, fmt.Errorf("unexpected EOF in senc IVs at sample %d", i)
 		}
@@ -139,7 +138,7 @@ func DecryptSegment(
 			subCount := binary.BigEndian.Uint16(moofData[offset : offset+2])
 			offset += 2
 			subsamples = make([]Subsample, subCount)
-			for s := uint16(0); s < subCount; s++ {
+			for s := range subCount {
 				if offset+6 > len(moofData) {
 					return nil, fmt.Errorf("unexpected EOF in senc subsample entry")
 				}
@@ -169,7 +168,7 @@ func DecryptSegment(
 
 	dataOffset := moofSize + 8 // Default fallback to right after moof + mdat header
 	if (trunFlags & 0x01) != 0 {
-		dataOffset = int(int32(binary.BigEndian.Uint32(moofData[trunOffset : trunOffset+4])))
+		dataOffset = int(binary.BigEndian.Uint32(moofData[trunOffset : trunOffset+4]))
 		trunOffset += 4
 	}
 	if (trunFlags & 0x04) != 0 {
@@ -182,7 +181,7 @@ func DecryptSegment(
 	hasCompTime := (trunFlags & 0x800) != 0
 
 	sampleSizes := make([]int, sampleCount)
-	for i := uint32(0); i < sampleCount; i++ {
+	for i := range sampleCount {
 		if hasDuration {
 			trunOffset += 4
 		}

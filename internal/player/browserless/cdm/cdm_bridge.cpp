@@ -249,8 +249,8 @@ int cdm_context_update_session(
 
     {
         std::unique_lock<std::mutex> lk(ctx->host.cv_m);
-        bool ok = ctx->host.update_cv.wait_for(lk, std::chrono::seconds(5), [&]{ 
-            return ctx->host.updateResolved || ctx->host.updateFailed; 
+        bool ok = ctx->host.update_cv.wait_for(lk, std::chrono::seconds(5), [&]{
+            return ctx->host.updateResolved || ctx->host.updateFailed;
         });
         if (!ok || ctx->host.updateFailed) {
             return -2;

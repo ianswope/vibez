@@ -56,6 +56,8 @@ func (c *CDM) SetServerCertificate(cert []byte) error {
 
 // GenerateChallenge creates a playback session for the given 16-byte Key ID (KID)
 // and returns the raw binary license challenge and the assigned session ID.
+//
+//nolint:gocritic // CGo-generated wrapper triggers false-positive dupSubExpr
 func (c *CDM) GenerateChallenge(kid []byte) ([]byte, string, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()

@@ -60,7 +60,7 @@ func (c *Client) FetchPlaybackInfo(ctx context.Context, songID string, prefer256
 	if err != nil {
 		return nil, fmt.Errorf("webPlayback request failed: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		raw, _ := io.ReadAll(resp.Body)
@@ -129,7 +129,7 @@ func (c *Client) FetchServerCertificate(ctx context.Context, certURL string) ([]
 	if err != nil {
 		return nil, fmt.Errorf("fetching widevine certificate: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("fetching widevine certificate failed (HTTP %d)", resp.StatusCode)
@@ -166,7 +166,7 @@ func (c *Client) AcquireLicense(ctx context.Context, licenseURL string, challeng
 	if err != nil {
 		return nil, fmt.Errorf("acquire license HTTP failed: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		raw, _ := io.ReadAll(resp.Body)

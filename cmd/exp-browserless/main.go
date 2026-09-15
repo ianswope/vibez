@@ -1,3 +1,5 @@
+//go:build linux
+
 package main
 
 import (
@@ -68,7 +70,7 @@ func main() {
 		res, err := provider.Search(ctx, "Daft Punk Get Lucky")
 		if err != nil || len(res.Tracks) == 0 {
 			fmt.Fprintf(os.Stderr, "Search failed or returned no tracks: %v\n", err)
-			os.Exit(1)
+			return
 		}
 		track := res.Tracks[0]
 		songID = track.ID
@@ -80,9 +82,9 @@ func main() {
 	cdmEngine, err := cdm.New(cdmPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to initialize CDM: %v\n", err)
-		os.Exit(1)
+		return
 	}
-	defer cdmEngine.Close()
+	defer func() { _ = cdmEngine.Close() }()
 
 	// 2. Fetch Playback Metadata via MZPlay
 	fmt.Println("[3/6] Fetching stream metadata via Apple MZPlay API...")
@@ -90,7 +92,7 @@ func main() {
 	info, err := licClient.FetchPlaybackInfo(ctx, songID, true)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to fetch playback info: %v\n", err)
-		os.Exit(1)
+		return
 	}
 	fmt.Printf("      Stream Flavor: %s\n", info.Flavor)
 	fmt.Printf("      Playlist URL:  %s\n", info.HLSPlaylistURL)
@@ -100,11 +102,11 @@ func main() {
 	cert, err := licClient.FetchServerCertificate(ctx, info.WidevineCertURL)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to fetch server certificate: %v\n", err)
-		os.Exit(1)
+		return
 	}
 	if err := cdmEngine.SetServerCertificate(cert); err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to set server certificate: %v\n", err)
-		os.Exit(1)
+		return
 	}
 
 	// 4. Download HLS Playlist and extract Key ID (KID)
@@ -113,18 +115,17 @@ func main() {
 	hlsResp, err := http.DefaultClient.Do(hlsReq)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to fetch HLS playlist: %v\n", err)
-		os.Exit(1)
+		return
 	}
-	defer hlsResp.Body.Close()
+	defer func() { _ = hlsResp.Body.Close() }()
 	playlistBytes, _ := io.ReadAll(hlsResp.Body)
 
 	var keyURI string
-	for _, line := range strings.Split(string(playlistBytes), "\n") {
+	for line := range strings.SplitSeq(string(playlistBytes), "\n") {
 		if strings.HasPrefix(line, "#EXT-X-KEY:") {
-			if idx := strings.Index(line, "URI=\""); idx != -1 {
-				rest := line[idx+5:]
-				if endIdx := strings.Index(rest, "\""); endIdx != -1 {
-					keyURI = rest[:endIdx]
+			if _, rest, ok := strings.Cut(line, "URI=\""); ok {
+				if uri, _, ok := strings.Cut(rest, "\""); ok {
+					keyURI = uri
 					break
 				}
 			}
@@ -132,13 +133,13 @@ func main() {
 	}
 	if keyURI == "" {
 		fmt.Fprintf(os.Stderr, "Could not find key URI in playlist\n")
-		os.Exit(1)
+		return
 	}
 	b64KID := strings.TrimPrefix(keyURI, "data:;base64,")
 	kidBytes, err := base64.StdEncoding.DecodeString(b64KID)
 	if err != nil || len(kidBytes) != 16 {
 		fmt.Fprintf(os.Stderr, "Invalid KID from URI (%s): %v\n", keyURI, err)
-		os.Exit(1)
+		return
 	}
 	fmt.Printf("      Key ID (hex): %x\n", kidBytes)
 
@@ -147,20 +148,20 @@ func main() {
 	challenge, sessionID, err := cdmEngine.GenerateChallenge(kidBytes)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to generate challenge: %v\n", err)
-		os.Exit(1)
+		return
 	}
 	fmt.Printf("      Generated %d-byte challenge for session %s\n", len(challenge), sessionID)
 
 	licBytes, err := licClient.AcquireLicense(ctx, info.HLSKeyServerURL, challenge, keyURI, songID)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "License acquisition failed: %v\n", err)
-		os.Exit(1)
+		return
 	}
 	fmt.Printf("      Received %d-byte signed license from Apple\n", len(licBytes))
 
 	if err := cdmEngine.UpdateSession(sessionID, licBytes); err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to update CDM session: %v\n", err)
-		os.Exit(1)
+		return
 	}
 
 	fmt.Println("\n=======================================================")
@@ -176,14 +177,14 @@ func main() {
 	streamServer, err := browserless.NewStreamServer(cdmEngine, licClient)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to start stream server: %v\n", err)
-		os.Exit(1)
+		return
 	}
-	defer streamServer.Close()
+	defer func() { _ = streamServer.Close() }()
 
 	streamURL, duration, err := streamServer.PrepareTrack(ctx, songID)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to prepare track stream: %v\n", err)
-		os.Exit(1)
+		return
 	}
 	fmt.Printf("      Stream URL: %s\n", streamURL)
 	fmt.Printf("      Duration:   %v\n", duration)
@@ -192,16 +193,15 @@ func main() {
 	gstPlayer, err := gst.New()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to init GStreamer player: %v\n", err)
-		os.Exit(1)
+		return
 	}
 	defer gstPlayer.Stop()
 
 	gstPlayer.PlayURI(streamURL)
-	for i := 0; i < 5; i++ {
+	for range 5 {
 		time.Sleep(1 * time.Second)
 		pos := gstPlayer.Position()
 		fmt.Printf("      [Playing...] Position: %v / %v\n", pos.Round(time.Millisecond), duration.Round(time.Second))
 	}
 	fmt.Println("\n🎉 LIVE GSTREAMER PLAYBACK TEST COMPLETED SUCCESSFULLY!")
 }
-

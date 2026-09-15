@@ -257,15 +257,16 @@ func (p *Player) Next() error {
 		return nil
 	}
 
-	if p.state.ShuffleMode && len(p.queue) > 1 {
-		p.idx = rand.Intn(len(p.queue))
-	} else if p.state.RepeatMode == player.RepeatModeOff && p.idx >= len(p.queue)-1 {
+	switch {
+	case p.state.ShuffleMode && len(p.queue) > 1:
+		p.idx = rand.Intn(len(p.queue)) //nolint:gosec // G404: weak random is sufficient for music shuffle
+	case p.state.RepeatMode == player.RepeatModeOff && p.idx >= len(p.queue)-1:
 		p.state.Playing = false
 		s := p.state
 		p.mu.Unlock()
 		p.bcast.Send(s)
 		return nil
-	} else {
+	default:
 		p.idx = (p.idx + 1) % len(p.queue)
 	}
 
