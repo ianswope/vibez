@@ -1173,6 +1173,12 @@ const (
 	stationMaxCalls    = 6
 )
 
+// ResolveCatalogSongID maps a library song ID ("i.XXXX") to its Apple Music
+// catalog ID using the /v1/me/library/songs/{id} endpoint.
+func (a *AppleProvider) ResolveCatalogSongID(ctx context.Context, libraryID string) (string, error) {
+	return a.resolveCatalogSongID(ctx, libraryID)
+}
+
 // resolveCatalogSongID maps a library song ID ("i.XXXX") to its Apple Music
 // catalog song ID via the song's playParams.catalogId. A station can only be
 // seeded by a catalog ID — seeding with a library ID returns HTTP 500. Returns

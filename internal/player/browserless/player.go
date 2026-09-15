@@ -30,13 +30,14 @@ type Player struct {
 	streamer  *StreamServer
 	gst       *gst.Player
 
-	mu       sync.RWMutex
-	state    player.State
-	bcast    player.Broadcast
-	queue    []provider.Track
-	idx      int
-	playCtx  context.CancelFunc
-	doneCh   chan struct{}
+	mu        sync.RWMutex
+	state     player.State
+	bcast     player.Broadcast
+	queue     []provider.Track
+	idx       int
+	playCtx   context.CancelFunc
+	doneCh    chan struct{}
+	closeOnce sync.Once
 }
 
 // New creates a ready browserless Player.
@@ -80,6 +81,22 @@ func New(cfg *config.Config, prov *apple.AppleProvider) (*Player, error) {
 	}
 
 	p.gst.OnEOS(func() {
+		p.mu.RLock()
+		playing := p.state.Playing
+		pos := p.gst.Position()
+		var dur time.Duration
+		if p.state.Track != nil {
+			dur = p.state.Track.Duration
+		}
+		p.mu.RUnlock()
+
+		if !playing {
+			return
+		}
+		if dur > 5*time.Second && pos < dur-5*time.Second {
+			// Ignore premature EOS
+			return
+		}
 		_ = p.Next()
 	})
 
@@ -148,9 +165,9 @@ func (p *Player) playTrack(t provider.Track) {
 		}
 		// If it's a library ID (starts with "i."), resolve catalog ID
 		if strings.HasPrefix(catalogID, "i.") && p.provider != nil {
-			resolved, err := p.provider.GetCatalogPlaylistTracks(ctx, catalogID)
-			if err == nil && len(resolved) > 0 && resolved[0].CatalogID != "" {
-				catalogID = resolved[0].CatalogID
+			resolved, err := p.provider.ResolveCatalogSongID(ctx, catalogID)
+			if err == nil && resolved != "" {
+				catalogID = resolved
 			}
 		}
 
@@ -488,15 +505,17 @@ func (p *Player) Subscribe() <-chan player.State {
 }
 
 func (p *Player) Close() error {
-	close(p.doneCh)
-	if p.gst != nil {
-		p.gst.Destroy()
-	}
-	if p.streamer != nil {
-		_ = p.streamer.Close()
-	}
-	if p.cdmEngine != nil {
-		_ = p.cdmEngine.Close()
-	}
+	p.closeOnce.Do(func() {
+		close(p.doneCh)
+		if p.gst != nil {
+			p.gst.Destroy()
+		}
+		if p.streamer != nil {
+			_ = p.streamer.Close()
+		}
+		if p.cdmEngine != nil {
+			_ = p.cdmEngine.Close()
+		}
+	})
 	return nil
 }

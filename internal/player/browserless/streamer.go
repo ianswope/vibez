@@ -159,8 +159,12 @@ func (s *StreamServer) PrepareTrack(ctx context.Context, trackID string) (string
 		} else if strings.HasPrefix(line, "#EXT-X-BYTERANGE:") {
 			var l, o int64
 			_, _ = fmt.Sscanf(strings.TrimPrefix(line, "#EXT-X-BYTERANGE:"), "%d@%d", &l, &o)
-			if i+1 < len(lines) && !strings.HasPrefix(lines[i+1], "#") && strings.TrimSpace(lines[i+1]) != "" {
-				segURI := strings.TrimSpace(lines[i+1])
+			for i+1 < len(lines) && strings.HasPrefix(strings.TrimSpace(lines[i+1]), "#") {
+				i++
+			}
+			if i+1 < len(lines) && strings.TrimSpace(lines[i+1]) != "" {
+				i++
+				segURI := strings.TrimSpace(lines[i])
 				segments = append(segments, segmentRef{
 					uri:      segURI,
 					offset:   o,
