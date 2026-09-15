@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [Unreleased]
+
+### Fixed
+- **A Playwright driver that failed to start said nothing about why**: `driverStderr()` returned `io.Discard`, so the driver's stderr went nowhere. Handing node a pipe rather than an `*os.File` is required, because `os/exec` passes a file descriptor straight through to the child and the driver's exit handler then restores a termios snapshot taken before BubbleTea switched the terminal to raw mode, leaving the shell with no echo or line editing after vibez quits. Discarding the output achieved that and cost the only account of a failed start. The driver now writes to a bounded 64 KiB buffer that is still a plain `io.Writer`, and its tail is attached to the error when startup or install fails. Every Playwright entry point in the package builds its options through one constructor, so a call site that misses `Stdout`, `Stderr` or `Logger` fails a test rather than silently handing the driver a terminal. Refs #103.
+
 ## [0.9.0] — 2026-09-14
 
 ### Added

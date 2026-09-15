@@ -457,14 +457,10 @@ func extractDeb(debPath, destDir string) error {
 // runPlaywright starts the Playwright driver backed by our cached Chrome.
 func runPlaywright() (*playwright.Playwright, error) {
 	_ = os.Setenv("PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS", "1")
-	pw, err := playwright.Run(&playwright.RunOptions{
-		DriverDirectory:     driverDir(),
-		SkipInstallBrowsers: true,
-		Stderr:              driverStderr(),
-		Logger:              driverLogger(),
-	})
+	opts, output := newDriverRunOptions(driverDir())
+	pw, err := playwright.Run(opts)
 	if err != nil {
-		return nil, fmt.Errorf("playwright driver: %w", err)
+		return nil, addDriverOutput(fmt.Errorf("playwright driver: %w", err), output)
 	}
 	return pw, nil
 }
