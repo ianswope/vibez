@@ -155,6 +155,7 @@ func (p *Player) playTrack(t provider.Track) {
 	p.state.Position = 0
 	p.state.Error = ""
 	s := p.state
+	prefer256k := p.state.Bitrate >= 256
 	p.mu.Unlock()
 	p.bcast.Send(s)
 
@@ -171,7 +172,7 @@ func (p *Player) playTrack(t provider.Track) {
 			}
 		}
 
-		streamURL, duration, err := p.streamer.PrepareTrack(ctx, catalogID)
+		streamURL, duration, err := p.streamer.PrepareTrack(ctx, catalogID, prefer256k)
 		if err != nil {
 			select {
 			case <-ctx.Done():
@@ -456,9 +457,17 @@ func (p *Player) RemoveFromQueue(idx int) error {
 		case idx == p.idx:
 			p.state.Track = nil
 			p.state.Playing = false
-			p.gst.Stop()
+			if p.gst != nil {
+				p.gst.Stop()
+			}
+			if p.idx >= len(p.queue) && len(p.queue) > 0 {
+				p.idx = len(p.queue) - 1
+			}
 		case idx < p.idx:
 			p.idx--
+		}
+		if p.idx >= len(p.queue) && len(p.queue) > 0 {
+			p.idx = len(p.queue) - 1
 		}
 	}
 	s := p.state
@@ -476,6 +485,15 @@ func (p *Player) MoveInQueue(from, to int) error {
 			to--
 		}
 		p.queue = append(p.queue[:to], append([]provider.Track{t}, p.queue[to:]...)...)
+
+		switch {
+		case p.idx == from:
+			p.idx = to
+		case from < p.idx && to >= p.idx:
+			p.idx--
+		case from > p.idx && to <= p.idx:
+			p.idx++
+		}
 	}
 	p.mu.Unlock()
 	return nil
@@ -487,7 +505,9 @@ func (p *Player) ClearQueue() error {
 	p.idx = 0
 	p.state.Track = nil
 	p.state.Playing = false
-	p.gst.Stop()
+	if p.gst != nil {
+		p.gst.Stop()
+	}
 	s := p.state
 	p.mu.Unlock()
 	p.bcast.Send(s)

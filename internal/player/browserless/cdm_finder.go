@@ -40,8 +40,7 @@ func DefaultCDMPath() string {
 	return filepath.Join(home, ".cache", "vibez", "cdm", "libwidevinecdm.so")
 }
 
-// EnsureCDM returns an existing CDM library path, or attempts to download
-// and extract the official standalone libwidevinecdm.so into ~/.cache/vibez/cdm/.
+// EnsureCDM returns an existing CDM library path from the host or user cache.
 func EnsureCDM() (string, error) {
 	if p := FindCDM(); p != "" {
 		return p, nil
@@ -58,8 +57,9 @@ func EnsureCDM() (string, error) {
 	if fi, err := os.Stat(cfgPath); err == nil && !fi.IsDir() && fi.Size() > 100000 {
 		// Copy to cache
 		if data, err := os.ReadFile(cfgPath); err == nil { //nolint:gosec // G304: user config path in home dir
-			_ = os.WriteFile(dest, data, 0600) //nolint:gosec // G703: fixed destination path inside user cache
-			return dest, nil
+			if err := os.WriteFile(dest, data, 0600); err == nil { //nolint:gosec // G306: destination path inside user cache
+				return dest, nil
+			}
 		}
 	}
 
