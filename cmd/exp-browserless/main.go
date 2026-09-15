@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"encoding/base64"
 	"flag"
@@ -14,9 +13,10 @@ import (
 	"time"
 
 	"github.com/simone-vibes/vibez/internal/config"
+	"github.com/simone-vibes/vibez/internal/player/browserless"
 	"github.com/simone-vibes/vibez/internal/player/browserless/cdm"
 	"github.com/simone-vibes/vibez/internal/player/browserless/license"
-	"github.com/simone-vibes/vibez/internal/player/browserless/mp4"
+	"github.com/simone-vibes/vibez/internal/player/gst"
 	"github.com/simone-vibes/vibez/internal/provider/apple"
 )
 
@@ -171,110 +171,37 @@ func main() {
 	fmt.Println("   - Zero browser processes running!")
 	fmt.Println("=======================================================")
 
-	// 6. Test full multi-segment playback
-	fmt.Println("\n[7/7] Testing multi-segment stream assembly...")
-	type segmentInfo struct {
-		uri    string
-		offset int64
-		length int64
+	// 6. Test StreamServer + GStreamer Live Streaming
+	fmt.Println("\n[7/8] Starting StreamServer loopback...")
+	streamServer, err := browserless.NewStreamServer(cdmEngine, licClient)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to start stream server: %v\n", err)
+		os.Exit(1)
 	}
-	var segments []segmentInfo
-	var initURI string
-	var initOffset, initLength int64
+	defer streamServer.Close()
 
-	lines := strings.Split(string(playlistBytes), "\n")
-	for i := 0; i < len(lines); i++ {
-		line := strings.TrimSpace(lines[i])
-		if strings.HasPrefix(line, "#EXT-X-MAP:") {
-			// Extract URI and BYTERANGE
-			if uIdx := strings.Index(line, "URI=\""); uIdx != -1 {
-				rest := line[uIdx+5:]
-				if endIdx := strings.Index(rest, "\""); endIdx != -1 {
-					initURI = rest[:endIdx]
-				}
-			}
-			if bIdx := strings.Index(line, "BYTERANGE=\""); bIdx != -1 {
-				rest := line[bIdx+11:]
-				if endIdx := strings.Index(rest, "\""); endIdx != -1 {
-					fmt.Sscanf(rest[:endIdx], "%d@%d", &initLength, &initOffset)
-				}
-			}
-		} else if strings.HasPrefix(line, "#EXT-X-BYTERANGE:") {
-			var l, o int64
-			fmt.Sscanf(strings.TrimPrefix(line, "#EXT-X-BYTERANGE:"), "%d@%d", &l, &o)
-			if i+1 < len(lines) && !strings.HasPrefix(lines[i+1], "#") && strings.TrimSpace(lines[i+1]) != "" {
-				segURI := strings.TrimSpace(lines[i+1])
-				segments = append(segments, segmentInfo{uri: segURI, offset: o, length: l})
-			}
-		}
+	streamURL, duration, err := streamServer.PrepareTrack(ctx, songID)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to prepare track stream: %v\n", err)
+		os.Exit(1)
 	}
+	fmt.Printf("      Stream URL: %s\n", streamURL)
+	fmt.Printf("      Duration:   %v\n", duration)
 
-	fmt.Printf("      Discovered %d audio segments in HLS playlist\n", len(segments))
-
-	// Resolve baseURL
-	baseURI := info.HLSPlaylistURL
-	if lastSlash := strings.LastIndex(baseURI, "/"); lastSlash != -1 {
-		baseURI = baseURI[:lastSlash+1]
+	fmt.Println("[8/8] Connecting to GStreamer and playing 5 seconds of live decrypted audio...")
+	gstPlayer, err := gst.New()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to init GStreamer player: %v\n", err)
+		os.Exit(1)
 	}
+	defer gstPlayer.Stop()
 
-	// Fetch Init Segment if not already cached
-	var initBytes []byte
-	if initURI != "" {
-		fullInitURL := baseURI + initURI
-		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, fullInitURL, nil)
-		if initLength > 0 {
-			req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", initOffset, initOffset+initLength-1))
-		}
-		resp, err := http.DefaultClient.Do(req)
-		if err == nil {
-			initBytes, _ = io.ReadAll(resp.Body)
-			resp.Body.Close()
-		}
+	gstPlayer.PlayURI(streamURL)
+	for i := 0; i < 5; i++ {
+		time.Sleep(1 * time.Second)
+		pos := gstPlayer.Position()
+		fmt.Printf("      [Playing...] Position: %v / %v\n", pos.Round(time.Millisecond), duration.Round(time.Second))
 	}
-	audioCfg, _ := mp4.ParseAudioConfig(initBytes)
-	fmt.Printf("      Audio Config: AAC-LC, %d Hz, %d channels\n", map[int]int{3: 48000, 4: 44100}[audioCfg.FreqIndex], audioCfg.ChanConfig)
-
-	// Decrypt first 3 segments (~30 seconds of audio)
-	testSegCount := 3
-	if len(segments) < testSegCount {
-		testSegCount = len(segments)
-	}
-
-	fmt.Printf("[+] Decrypting first %d segments (~%d seconds of music)...\n", testSegCount, testSegCount*10)
-	var fullDecrypted bytes.Buffer
-	for i := 0; i < testSegCount; i++ {
-		seg := segments[i]
-		segURL := baseURI + seg.uri
-		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, segURL, nil)
-		if seg.length > 0 {
-			req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", seg.offset, seg.offset+seg.length-1))
-		}
-		tFetch := time.Now()
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Failed to download segment %d: %v\n", i, err)
-			break
-		}
-		data, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		fetchTime := time.Since(tFetch)
-
-		tDec := time.Now()
-		decAAC, err := mp4.DecryptSegment(data, kidBytes, audioCfg, cdmEngine.Decrypt)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Failed to decrypt segment %d: %v\n", i, err)
-			break
-		}
-		decTime := time.Since(tDec)
-
-		fullDecrypted.Write(decAAC)
-		fmt.Printf("      Segment %d/%d: %d bytes encrypted -> %d bytes AAC (download: %v, decrypt: %v)\n",
-			i+1, testSegCount, len(data), len(decAAC), fetchTime.Round(time.Millisecond), decTime.Round(time.Millisecond))
-	}
-
-	outPath := "/tmp/vibez_browserless_preview.aac"
-	_ = os.WriteFile(outPath, fullDecrypted.Bytes(), 0644)
-	fmt.Printf("\n🎵 Multi-segment preview saved to %s (%d bytes, ~30s of music)!\n", outPath, fullDecrypted.Len())
-	fmt.Println("🚀 You can listen to it with: gst-play-1.0 /tmp/vibez_browserless_preview.aac")
+	fmt.Println("\n🎉 LIVE GSTREAMER PLAYBACK TEST COMPLETED SUCCESSFULLY!")
 }
 

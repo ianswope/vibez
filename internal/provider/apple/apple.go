@@ -1434,3 +1434,31 @@ func (a *AppleProvider) GetRecommendations(ctx context.Context) ([]provider.Reco
 	}
 	return groups, nil
 }
+
+// GetCatalogTracks fetches track metadata for a list of catalog song IDs.
+func (a *AppleProvider) GetCatalogTracks(ctx context.Context, ids []string) ([]provider.Track, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	sf, err := a.storefront(ctx)
+	if err != nil {
+		return nil, err
+	}
+	ep := fmt.Sprintf("/catalog/%s/songs?ids=%s", sf, url.QueryEscape(strings.Join(ids, ",")))
+	req, err := a.newRequest(ctx, http.MethodGet, ep)
+	if err != nil {
+		return nil, err
+	}
+	var resp struct {
+		Data []songResource `json:"data"`
+	}
+	if err := a.do(req, &resp); err != nil {
+		return nil, err
+	}
+	tracks := make([]provider.Track, len(resp.Data))
+	for i, s := range resp.Data {
+		tracks[i] = toTrack(s)
+	}
+	return tracks, nil
+}
+

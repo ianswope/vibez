@@ -12,6 +12,7 @@ import (
 	tea "charm.land/bubbletea/v2"
 	"github.com/simone-vibes/vibez/internal/auth"
 	"github.com/simone-vibes/vibez/internal/config"
+	"github.com/simone-vibes/vibez/internal/player/browserless"
 	"github.com/simone-vibes/vibez/internal/player/cdp"
 	"github.com/simone-vibes/vibez/internal/player/mpris"
 	"github.com/simone-vibes/vibez/internal/player/webkit"
@@ -22,6 +23,9 @@ import (
 )
 
 func runPlatform(cfg *config.Config, iconPath string, opts tui.Options, onUserToken, onStorefront func(string), audioBitrateKbps int) error {
+	if browserless.FindCDM() != "" {
+		return runBrowserlessFlow(cfg, opts, onUserToken, onStorefront, audioBitrateKbps)
+	}
 	if cdp.Available() {
 		return runCDPFlow(cfg, opts, onUserToken, onStorefront, audioBitrateKbps, cdpPlatformHooks{
 			initStatus: "Initializing vibez...",
