@@ -121,6 +121,7 @@ func runTUI(_ *cobra.Command, _ []string) error {
 		opts.IconPath = iconPath
 		opts.InitialTracks = tracks
 		opts.Backend = "Local mode · playing from " + cfg.MusicDir
+		opts.ScanNotice = prov.ScanNotice()
 		prog := tea.NewProgram(tui.New(cfg, prov, plyr, opts))
 		_, err = prog.Run()
 		return err

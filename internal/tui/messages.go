@@ -18,6 +18,11 @@ type Options struct {
 	Backend string
 	// InitialTracks pre-populates the queue panel on launch (used by local mode).
 	InitialTracks []provider.Track
+	// ScanNotice summarises what a local-mode directory scan left out. It is
+	// recorded in the debug log on startup, and shown in the status bar when
+	// the scan produced no tracks at all, because an empty library otherwise
+	// looks identical to a mistyped path.
+	ScanNotice string
 }
 
 // InitStatusMsg updates the status text shown on the loading screen.

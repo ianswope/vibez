@@ -414,6 +414,13 @@ func New(cfg *config.Config, prov provider.Provider, plyr player.Player, opts Op
 	if opts.Backend != "" {
 		m.appendLog("[engine] backend: " + opts.Backend)
 	}
+	if opts.ScanNotice != "" {
+		m.appendLog("[local] " + opts.ScanNotice)
+		if len(opts.InitialTracks) == 0 {
+			m.errMsg = opts.ScanNotice
+			m.errExpiry = time.Now().Add(30 * time.Second)
+		}
+	}
 	if len(opts.InitialTracks) > 0 {
 		ids := make([]string, len(opts.InitialTracks))
 		for i, t := range opts.InitialTracks {
@@ -3272,13 +3279,9 @@ func (m *Model) nowPlayingTextLines(contentW, h int) []string {
 		lines[mid] = centerStr(muted.Render("silence is not a vibe"), contentW)
 		lines[h-2] = centerStr(muted.Render("made with ❤️ by simonepelosi · press ? for about"), contentW)
 		if m.errMsg != "" {
-			var errRendered string
-			if strings.HasPrefix(m.errMsg, "✓") {
-				errRendered = centerStr(styles.ControlActive.Render(m.errMsg), contentW)
-			} else {
-				errRendered = centerStr(styles.ErrorStyle.Render("⚠  "+m.errMsg), contentW)
-			}
-			lines[max(0, mid-2)] = errRendered
+			// statusLine renders this identically and truncates to the width,
+			// which a message long enough to explain itself needs.
+			lines[max(0, mid-2)] = m.statusLine(contentW)
 		}
 		return lines
 	}
