@@ -24,7 +24,7 @@ import (
 
 func runPlatform(cfg *config.Config, iconPath string, opts tui.Options, onUserToken, onStorefront func(string), audioBitrateKbps int) error {
 	wantBrowserless := browserlessFlag || os.Getenv("VIBEZ_BROWSERLESS") == "1"
-	if wantBrowserless && browserless.FindCDM() != "" {
+	if wantBrowserless {
 		return runBrowserlessFlow(cfg, opts, onUserToken, onStorefront, audioBitrateKbps)
 	}
 	if cdp.Available() {
