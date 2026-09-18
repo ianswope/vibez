@@ -4004,3 +4004,45 @@ func TestNoResultsError(t *testing.T) {
 		t.Errorf("noResultsError = %q, want the repeated reason collapsed to one", got)
 	}
 }
+
+// --- local-mode scan notice ---
+
+// logContains reports whether any debug log entry carries want.
+func logContains(m *Model, want string) bool {
+	for _, entry := range m.debugLog {
+		if strings.Contains(entry, want) {
+			return true
+		}
+	}
+	return false
+}
+
+func TestNew_ScanNoticeShownWhenTheLibraryIsEmpty(t *testing.T) {
+	notice := "no playable tracks in /music: skipped 4 files (4 .ogg); macOS plays .flac, .m4a, .mp3"
+	m := New(testCfg(), &mockProvider{}, newMockPlayer(), Options{ScanNotice: notice})
+
+	if m.errMsg != notice {
+		t.Errorf("errMsg = %q, want the notice", m.errMsg)
+	}
+	if !m.errExpiry.After(time.Now().Add(20 * time.Second)) {
+		t.Errorf("errExpiry = %v, want long enough to read past the intro", m.errExpiry)
+	}
+	if !logContains(m, notice) {
+		t.Errorf("debugLog = %v, want an entry carrying the notice", m.debugLog)
+	}
+}
+
+func TestNew_ScanNoticeOnlyLoggedWhenTracksWereFound(t *testing.T) {
+	notice := "indexed 1 of 5 files in /music: skipped 4 files (4 .ogg); macOS plays .flac, .m4a, .mp3"
+	m := New(testCfg(), &mockProvider{}, newMockPlayer(), Options{
+		ScanNotice:    notice,
+		InitialTracks: []provider.Track{{ID: "local:/music/a.mp3", Title: "A"}},
+	})
+
+	if m.errMsg != "" {
+		t.Errorf("errMsg = %q, want empty when the scan found tracks", m.errMsg)
+	}
+	if !logContains(m, notice) {
+		t.Errorf("debugLog = %v, want an entry carrying the notice", m.debugLog)
+	}
+}

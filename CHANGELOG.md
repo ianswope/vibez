@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Local mode gave no sign when a file's format was unsupported on that platform**: `scan()` dropped every file whose extension was missing from the platform's `supportedExts` map and counted nothing, so a macOS user whose library is OGG got a TUI headed `Local mode · playing from ~/Music` with nothing in it. That is what a mistyped path, an empty directory and an unreadable file all look like too, and only the format case has a remedy the user can act on. The scan now counts what it left out and why, and the provider renders it as one line: `no playable tracks in /home/user/Music: macOS plays .flac, .m4a, .mp3; skipped 412 files (410 .ogg, 2 .jpg)`. It reaches the debug log on every local launch and the status bar when the library came back empty, with the playable set ahead of the detail because a status bar truncates from the right. The now-playing box renders that line through `statusLine` rather than its own copy of it, so a message long enough to explain itself is truncated to the width instead of overflowing the box. The supported set is named because it is not written down anywhere else a user would look: the README does not mention `--local`, and `--help` does not qualify it by platform. Closes #134.
+
 ## [0.9.1] — 2026-09-15
 
 ### Fixed
