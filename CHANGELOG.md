@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **Dithered album art** — the `:art` view now draws the cover as dithered pixel art: it is reduced to a 16-colour palette, Atkinson-dithered and drawn with Unicode sextants (2×3 solid sub-pixels per cell), which Alacritty, kitty, Ghostty, WezTerm and foot draw themselves, so it tiles without gaps. Terminal.app, which cannot draw sextants, keeps the half-block renderer.
+
 ### Added
 - Native Windows amd64 builds with installed-Chrome discovery, MusicKit/CDP startup, browser URL opening, per-user configuration/cache paths, Discord named-pipe IPC, and Windows CI, Dev Build, and ZIP release targets.
 - Windows local-file playback through Chrome for MP3, FLAC, M4A/AAC, and OGG, including queue editing, repeat/shuffle, seeking, volume, and Web Audio equalization. Library files are served only through opaque per-session loopback URLs.
