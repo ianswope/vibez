@@ -9,16 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Changed
-- **Dithered album art** — the `:art` view now draws the cover as dithered pixel art: it is reduced to a 16-colour palette, Atkinson-dithered and drawn with Unicode sextants (2×3 solid sub-pixels per cell), which Alacritty, kitty, Ghostty, WezTerm and foot draw themselves, so it tiles without gaps. Terminal.app, which cannot draw sextants, keeps the half-block renderer.
+## [1.1.0] — 2026-10-10
 
 ### Added
-- Native Windows amd64 builds with installed-Chrome discovery, MusicKit/CDP startup, browser URL opening, per-user configuration/cache paths, Discord named-pipe IPC, and Windows CI, Dev Build, and ZIP release targets.
-- Windows local-file playback through Chrome for MP3, FLAC, M4A/AAC, and OGG, including queue editing, repeat/shuffle, seeking, volume, and Web Audio equalization. Library files are served only through opaque per-session loopback URLs.
-- Windows self-update replaces a running executable with rollback on installation failure and retains console ownership while the replacement runs. Old executable backups are removed once unlocked on a later update check.
+- **Native Windows support** — full native Windows amd64 support without cgo. Includes installed Google Chrome discovery, headless MusicKit/CDP playback, Windows URL association opening, per-user configuration and cache paths (`%APPDATA%` / `%LOCALAPPDATA%`), Discord Rich Presence over Windows named pipes (`\\.\pipe\discord-ipc-*`), and atomic self-updating with rollback. Closes #147, refs #148.
+- **Windows local file playback** — local music directory playback on Windows through a secured loopback HTTP server and Chrome audio engine, supporting MP3, FLAC, M4A/AAC, and OGG formats, full equalizer controls, seeking, volume, and repeat/shuffle modes. Refs #148.
+
+### Changed
+- **Dithered album art** — the `:art` view now renders album covers as crisp dithered pixel art using Unicode sextants (`U+1FB00`) and Atkinson error diffusion with a 16-color palette on terminals that support sextants (kitty, Ghostty, WezTerm, Alacritty, foot), gracefully falling back to half-blocks on Apple Terminal. Closes #146.
 
 ### Fixed
-- Auto-update on Linux never installed anything: the writability check opened the running binary, which Linux refuses for any executing file (`ETXTBSY`), so every release since v0.1.0 silently gave up before downloading. The check now probes the install directory, as it already did on Windows.
+- **Linux auto-update** — auto-updating on Linux was previously failing silently because the writability check opened the running executable with `O_WRONLY`, which the Linux kernel rejects with `ETXTBSY` ("Text file busy"). The updater now validates write permissions and probes the install directory, enabling reliable in-place self-updates across all platforms. Refs #160.
+- **MusicKit concurrent play requests** — avoided duplicate `m.play()` calls and race conditions during rapid queue changes and resumes by debouncing playback requests via `_ensurePlaying` and ignoring extraneous resume calls while queue builds are in-flight. Refs #153.
+- **Apple search test data race** — resolved a data race in `TestSearch_QueryEncoded` by synchronizing concurrent request logging across goroutines with a mutex. Refs #159.
 - Saved volume and equalizer settings are restored for players supplied at TUI startup, including local mode, not only engines initialized asynchronously.
 - Windows local and CDP player shutdown releases broadcast subscribers; the TUI stops consuming a closed state stream instead of spinning.
 - Local-player shutdown on Linux and macOS is idempotent, preventing a panic when TUI quit is followed by deferred cleanup.
@@ -28,6 +31,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Verification
 - Windows CLI/TUI, local codec playback, equalization, Widevine capability, MusicKit invalid-token handling, and running-executable replacement have been exercised. Apple sign-in and full-track Apple Music streaming still require verification with an authorized developer token; no lossless Apple Music support is claimed.
+
+### Thanks
+- Thanks to @hiKareeem for implementing native Windows support (#148).
+- Thanks to @chriopter for creating the dithered sextant album art renderer (#146).
+- Thanks to @ianswope for uncovering and fixing the Linux auto-update ETXTBSY bug (#160), fixing the Apple search test race (#159), and rigorous cross-platform reviews.
+- Thanks to @Wang-Yang-source for fixing concurrent MusicKit play race conditions during queue changes (#153).
 
 ## [1.0.0] — 2026-09-29
 
@@ -701,7 +710,8 @@ First public pre-release of vibez.
 
 ---
 
-[Unreleased]: https://github.com/simonepelosi/vibez/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/simonepelosi/vibez/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/simonepelosi/vibez/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/simonepelosi/vibez/compare/v0.9.2...v1.0.0
 [0.9.2]: https://github.com/simonepelosi/vibez/compare/v0.9.1...v0.9.2
 [0.9.1]: https://github.com/simonepelosi/vibez/compare/v0.9.0...v0.9.1
