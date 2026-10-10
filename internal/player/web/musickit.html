@@ -403,6 +403,22 @@
           else        _doPlayAt(next);
         }
 
+        // Share one start operation across keyboard, media-session and queue callers.
+        // MusicKit may already be playing after setQueue/changeToMediaAtIndex.
+        let _playPending = null;
+        async function _ensurePlaying(m) {
+          if (_playPending) return _playPending;
+          if (m.playbackState === 2) return;
+          _playPending = Promise.resolve().then(async () => {
+            if (m.playbackState === 2) return;
+            // Normalize transitional states without stop(), which resets position.
+            if (![3, 4].includes(m.playbackState)) await m.pause();
+            await m.play();
+          });
+          try { await _playPending; }
+          finally { _playPending = null; }
+        }
+
         // Build the whole native queue once, so MusicKit advances without a
         // setQueue/play round trip — and without a media-element src swap — at
         // every boundary. See the measurements above the flag declarations.
@@ -423,7 +439,7 @@
             _qi = startIdx;
             _nativeQueue   = true;
             _nativeMirrors = true;
-            await m.play();
+            await _ensurePlaying(m);
             _log(`[js:native] playing ${_q.length} item(s) from #${startIdx}`);
           } catch(e) {
             _nativeQueue   = false;
@@ -645,7 +661,7 @@
             }
 
             try {
-              await m.play();
+              await _ensurePlaying(m);
               _log(`[js:doPlay] playing ✓ #${idx}`);
             } catch(e) {
               if (isUnavailable(e)) {
@@ -722,11 +738,12 @@
         });
 
         window.vibezPlay = async () => {
+          if (_busy) return; // An in-flight queue change starts playback itself.
           const m = _m();
           _log(`[js:play] state=${_stateN[m.playbackState]||m.playbackState} item=${m.nowPlayingItem?.id||'null'} _qi=${_qi}`);
           // Restart from _qi if nothing is loaded (queue ended or fresh start).
           if (!m.nowPlayingItem && _qi >= 0 && _q.length > 0) { _log('[js:play] restart _qi'); _playAt(_qi); return; }
-          try { await m.play(); _log('[js:play] resumed ✓'); }
+          try { await _ensurePlaying(m); _log('[js:play] resumed ✓'); }
           catch(e) {
             if (e?.name === 'CONTENT_EQUIVALENT') {
               // CE on resume: force stop → play to break out of the stuck state.
@@ -734,7 +751,7 @@
               // same item and trigger another CE chain.
               _log('[js:play] CE → stop+play to recover');
               await m.stop().catch(() => {});
-              try { await m.play(); _log('[js:play] recovered ✓'); }
+              try { await _ensurePlaying(m); _log('[js:play] recovered ✓'); }
               catch(e2) { _log(`[js:play] recovery failed: ${errName(e2)}`); goError('play: '+errName(e2)).catch(()=>{}); }
             } else {
               _log(`[js:play] error: ${errName(e)}`);
