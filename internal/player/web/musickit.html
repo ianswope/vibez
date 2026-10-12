@@ -382,12 +382,9 @@
             const m = _m();
             if (!_following(m) || _busy || _qi < 0) return;
             const idx = _nextIndex(m);
-            // Last item with repeat off: MusicKit may still hold a stale next,
-            // and there is no supported way to drop it. _syncQueueIndex stops
-            // it on arrival.
-            if (idx < 0) return;
+            const q   = m.queue;
+            if (idx < 0) { await _dropStaleTail(q); return; }
             const want = _q[idx];
-            const q    = m.queue;
             const have = q?.items?.[q.position + 1];
             if (have?.id === want.id) return;
             _log(`[js:sync] next is ${have?.id ?? 'nothing'}, want #${idx} ${want.id}`);
@@ -395,6 +392,24 @@
             catch(e) { _log(`[js:sync] playNext failed: ${errName(e)}`); }
           });
           return _syncChain;
+        }
+
+        // Last item of _q with repeat off: whatever MusicKit still holds after
+        // it is stale, and must not start. Stopping it on arrival is too late,
+        // because Apple logs a play to Recently Played the moment a track
+        // starts (seen in #165 testing from one that played for under a
+        // second). queue.remove is deprecated but works on a live queue (#96
+        // probe, phase D), so it is used for this case only. If it fails or is
+        // gone, _followArrival still stops the stale item when it starts.
+        // Removed from the end so the indices still to remove do not shift.
+        async function _dropStaleTail(q) {
+          if (!q || typeof q.remove !== 'function') return;
+          const pos = q.position;
+          const len = q.items?.length ?? 0;
+          if (typeof pos !== 'number' || len <= pos + 1) return;
+          _log(`[js:sync] last item, dropping ${len - pos - 1} stale item(s) after it`);
+          try { for (let i = len - 1; i > pos; i--) await q.remove(i); }
+          catch(e) { _log(`[js:sync] queue.remove failed: ${errName(e)}`); }
         }
 
         // Set by vibezPrev just before it steps MusicKit back. A step back has

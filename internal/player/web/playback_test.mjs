@@ -174,6 +174,7 @@ function nativeQueue(ids, position = 0) {
   async skipToPreviousItem() { calls.push('skipToPrevious'); this.queue.position--; },
   async stop() { calls.push('stop'); },
  };
+ m.queue.remove = async i => { calls.push('remove:' + m.queue.items[i].id); m.queue.items.splice(i, 1); };
  return { m, calls };
 }
 const between = (from, to) => {
@@ -219,7 +220,7 @@ test('a move makes MusicKit play the moved track next without touching the curre
  assert.equal(m.queue.position, 0, 'the current track keeps playing');
  assert.equal(m.queue.items[1].id, 'd');
 });
-test('playback follows the reordered _q to the end, then stops on the stale tail', async () => {
+test('playback follows the reordered _q to the end, and the stale tail is dropped', async () => {
  const { env, m, calls, advance } = setupFollow({ q: ['a', 'b', 'c', 'd'] });
  env.window.vibezQueueMove(3, 1);   // a,d,b,c
  env.window.vibezQueueMove(3, 2);   // a,d,c,b
@@ -228,9 +229,29 @@ test('playback follows the reordered _q to the end, then stops on the stale tail
  for (let i = 0; i < 3; i++) { await advance(); played.push(m.nowPlayingItem.id); }
  assert.deepEqual(played, ['a', 'd', 'c', 'b']);
  assert.equal(env._qi, 3);
- await advance(); // MusicKit reaches whatever was displaced
+ // Stale items must never start: Apple logs a play the moment one does.
+ assert.equal(m.queue.items.length, m.queue.position + 1, 'nothing left after the last item');
+ assert.deepEqual(calls.filter(c => c.startsWith('remove:')), ['remove:d', 'remove:c']);
+});
+test('without queue.remove, a stale item past the end is stopped when it starts', async () => {
+ const { env, m, calls, advance } = setupFollow({ q: ['a', 'b'], qi: 1, native: ['a', 'b', 'x'], mirrors: false });
+ delete m.queue.remove;
+ await env._syncNext();
+ await advance();
  assert.equal(calls.at(-1), 'stop');
  assert.equal(env._nativeQueue, false);
+});
+test('a failing queue.remove leaves the stop-on-arrival fallback in place', async () => {
+ const { env, m, calls, advance } = setupFollow({ q: ['a', 'b'], qi: 1, native: ['a', 'b', 'x'], mirrors: false });
+ m.queue.remove = async () => { throw new Error('deprecated'); };
+ await env._syncNext();
+ await advance();
+ assert.equal(calls.at(-1), 'stop');
+});
+test('nothing is dropped while a next item is still wanted', async () => {
+ const { env, calls } = setupFollow({ q: ['a', 'b', 'c'], native: ['a', 'b', 'c', 'x'], mirrors: false });
+ await env._syncNext();
+ assert.deepEqual(calls, []);
 });
 test('a next that already matches _q is left alone', async () => {
  const { env, calls } = setupFollow({ q: ['a', 'b', 'c'], native: ['a', 'b', 'x'], mirrors: false });
