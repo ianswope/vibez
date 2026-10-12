@@ -154,3 +154,164 @@ test('playNext in one-item mode does not swap library items', async () => {
  assert.equal(ids(), 'a,b,i.L1,c');
  assert.equal(calls.length, 0);
 });
+
+// ─── Following a reordered _q (#161) ─────────────────────────────────────────
+// A fake native queue with the behaviour the #161 probe measured: playNext
+// inserts at position + 1, so the latest call is always next, and nothing
+// can be removed.
+function nativeQueue(ids, position = 0) {
+ const calls = [];
+ const m = {
+  repeatMode: 0, shuffleMode: 0, playbackState: 2,
+  currentPlaybackTime: 0, currentPlaybackDuration: 200,
+  queue: { items: ids.map(id => ({ id })), position },
+  get nowPlayingItem() { return this.queue.items[this.queue.position]; },
+  async playNext(d) {
+   calls.push('playNext:' + d.items.map(i => i.id).join(','));
+   this.queue.items.splice(this.queue.position + 1, 0, ...d.items.map(i => ({ id: i.id })));
+  },
+  async skipToNextItem() { calls.push('skipToNext'); this.queue.position++; },
+  async skipToPreviousItem() { calls.push('skipToPrevious'); this.queue.position--; },
+  async stop() { calls.push('stop'); },
+ };
+ return { m, calls };
+}
+const between = (from, to) => {
+ const start = html.indexOf(from);
+ const end = html.indexOf(to, start);
+ assert.ok(start >= 0 && end > start, `musickit.html no longer has ${from}`);
+ return html.slice(start, end);
+};
+function setupFollow({ q, qi = 0, native, position = qi, mirrors = true }) {
+ const { m, calls } = nativeQueue(native ?? q, position);
+ const env = {
+  window: {}, music: { addEventListener: () => {} }, _m: () => m, _log: () => {},
+  _q: q.map(id => ({ id })), _qi: qi, _busy: false,
+  _nativeQueue: true, _nativeMirrors: mirrors, _removedIds: new Set(),
+  _nativeHasNext: mm => mm.repeatMode !== 0 || mm.queue.position < mm.queue.items.length - 1,
+  _playNativeAt: idx => calls.push('rebuild:' + idx),
+  _playAt: idx => calls.push('playAt:' + idx),
+  errName: e => e.message, goError: () => Promise.resolve(),
+  setTimeout: (...a) => setTimeout(...a), clearTimeout: t => clearTimeout(t),
+ };
+ runInNewContext([
+  between('        // Following _q: MusicKit plays', "music.addEventListener('nowPlayingItemDidChange', _syncQueueIndex);"),
+  between('        let _stallTimer = null;', "music.addEventListener('playbackStateDidChange'"),
+  between('window.vibezNext  = () =>', 'const _repeatName'),
+  between('window.vibezQueueRemove = function', 'window.vibezQueueClear'),
+ ].join('\n'), env);
+ const ids = () => env._q.map(i => i.id).join(',');
+ // Let MusicKit advance on its own, as at a natural track boundary.
+ const advance = async () => {
+  m.queue.position++;
+  env._syncQueueIndex();
+  await env._syncNext();
+ };
+ return { env, m, calls, ids, advance };
+}
+
+test('a move makes MusicKit play the moved track next without touching the current one', async () => {
+ const { env, m, calls, ids } = setupFollow({ q: ['a', 'b', 'c', 'd'] });
+ env.window.vibezQueueMove(3, 1);
+ await env._syncNext();
+ assert.equal(ids(), 'a,d,b,c');
+ assert.deepEqual(calls, ['playNext:d']);
+ assert.equal(m.queue.position, 0, 'the current track keeps playing');
+ assert.equal(m.queue.items[1].id, 'd');
+});
+test('playback follows the reordered _q to the end, then stops on the stale tail', async () => {
+ const { env, m, calls, advance } = setupFollow({ q: ['a', 'b', 'c', 'd'] });
+ env.window.vibezQueueMove(3, 1);   // a,d,b,c
+ env.window.vibezQueueMove(3, 2);   // a,d,c,b
+ await env._syncNext();
+ const played = [m.nowPlayingItem.id];
+ for (let i = 0; i < 3; i++) { await advance(); played.push(m.nowPlayingItem.id); }
+ assert.deepEqual(played, ['a', 'd', 'c', 'b']);
+ assert.equal(env._qi, 3);
+ await advance(); // MusicKit reaches whatever was displaced
+ assert.equal(calls.at(-1), 'stop');
+ assert.equal(env._nativeQueue, false);
+});
+test('a next that already matches _q is left alone', async () => {
+ const { env, calls } = setupFollow({ q: ['a', 'b', 'c'], native: ['a', 'b', 'x'], mirrors: false });
+ await env._syncNext();
+ assert.deepEqual(calls, []);
+});
+test('nothing is synced while _q still mirrors MusicKit or under native shuffle', async () => {
+ const mirrored = setupFollow({ q: ['a', 'b'], native: ['a', 'x'] });
+ await mirrored.env._syncNext();
+ assert.deepEqual(mirrored.calls, []);
+ const shuffled = setupFollow({ q: ['a', 'b'], native: ['a', 'x'], mirrors: false });
+ shuffled.m.shuffleMode = 1;
+ await shuffled.env._syncNext();
+ assert.deepEqual(shuffled.calls, []);
+});
+test('repeat-all at the last item makes the first item next', async () => {
+ const { env, m, calls } = setupFollow({ q: ['a', 'b', 'c'], qi: 2, native: ['a', 'b', 'c'], mirrors: false });
+ m.repeatMode = 2;
+ await env._syncNext();
+ assert.deepEqual(calls, ['playNext:a']);
+ m.queue.position++;
+ env._syncQueueIndex();
+ assert.equal(env._qi, 0);
+});
+test('removing the next item replaces it in MusicKit', async () => {
+ const { env, calls, ids } = setupFollow({ q: ['a', 'b', 'c'] });
+ env.window.vibezQueueRemove('1');
+ await env._syncNext();
+ assert.equal(ids(), 'a,c');
+ assert.deepEqual(calls, ['playNext:c']);
+});
+test('an unexpected arrival is rebuilt from _q at the index that should be playing', async () => {
+ const { env, m, calls } = setupFollow({ q: ['a', 'b', 'c'], native: ['a', 'x', 'b', 'c'], mirrors: false });
+ m.queue.position = 1; // the correction did not land before the boundary
+ env._syncQueueIndex();
+ assert.deepEqual(calls, ['rebuild:1']);
+});
+test('arrivals during a rebuild are left to the rebuild', async () => {
+ const { env, m, calls } = setupFollow({ q: ['a', 'b', 'c'], native: ['a', 'x'], mirrors: false });
+ env._busy = true;
+ m.queue.position = 1;
+ env._syncQueueIndex();
+ assert.deepEqual(calls, []);
+ assert.equal(env._qi, 0);
+});
+test('next at the end of _q does not skip into a stale item', () => {
+ const { env, calls } = setupFollow({ q: ['a', 'b'], qi: 1, native: ['a', 'b', 'x'], mirrors: false });
+ env.window.vibezNext();
+ assert.deepEqual(calls, []);
+});
+test('prev steps back natively when MusicKit history matches _q, and rebuilds otherwise', () => {
+ const agree = setupFollow({ q: ['a', 'b', 'c'], qi: 1, native: ['a', 'b', 'c'], mirrors: false });
+ agree.env.window.vibezPrev();
+ assert.deepEqual(agree.calls, ['skipToPrevious']);
+ agree.env._syncQueueIndex();
+ assert.equal(agree.env._qi, 0);
+ // a was moved after b while b played: MusicKit's history still says a.
+ const moved = setupFollow({ q: ['c', 'b', 'a'], qi: 1, native: ['a', 'b', 'c'], mirrors: false });
+ moved.env.window.vibezPrev();
+ assert.deepEqual(moved.calls, ['rebuild:0']);
+});
+test('a stall at the end of a track rebuilds at the next index', async (t) => {
+ t.mock.timers.enable({ apis: ['setTimeout'] });
+ const { env, m, calls } = setupFollow({ q: ['a', 'b', 'c'], mirrors: false });
+ m.playbackState = 8; m.currentPlaybackTime = 199;
+ env._watchStall(m);
+ t.mock.timers.tick(3000);
+ assert.deepEqual(calls, ['rebuild:1']);
+});
+test('waiting mid-track, or a stall that clears, is left alone', async (t) => {
+ t.mock.timers.enable({ apis: ['setTimeout'] });
+ const mid = setupFollow({ q: ['a', 'b'], mirrors: false });
+ mid.m.playbackState = 8; mid.m.currentPlaybackTime = 60;
+ mid.env._watchStall(mid.m);
+ t.mock.timers.tick(3000);
+ assert.deepEqual(mid.calls, []);
+ const cleared = setupFollow({ q: ['a', 'b'], mirrors: false });
+ cleared.m.playbackState = 8; cleared.m.currentPlaybackTime = 199;
+ cleared.env._watchStall(cleared.m);
+ cleared.m.playbackState = 2;
+ cleared.env._watchStall(cleared.m);
+ t.mock.timers.tick(3000);
+ assert.deepEqual(cleared.calls, []);
+});

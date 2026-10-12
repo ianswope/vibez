@@ -266,6 +266,11 @@
         //                    authority stays with MusicKit, which is why the two
         //                    cannot be the same flag.
         //
+        // Once _nativeMirrors is false with shuffle off, _q is followed rather
+        // than mirrored: MusicKit's queue is left as it is, and only its next
+        // item is kept equal to _q[_qi+1] (_syncNext). See _syncNext for why
+        // that is enough.
+        //
         // Why native mode exists. Measured with the #96 probe on MusicKit
         // 3.2526.0-prerelease.x, from the media element's own currentTime at a
         // 50 ms poll. Every arm is two items over the same track pair, with the
@@ -342,17 +347,102 @@
           }
         }
 
+        // Following _q: MusicKit plays _q[_qi+1] next because _syncNext put it
+        // there, not because the two queues agree, so its queue position says
+        // nothing about _qi. Native shuffle is excluded: MusicKit picks its
+        // own order there, and _q only drives the view.
+        function _following(m) {
+          return _nativeQueue && !_nativeMirrors && !m.shuffleMode;
+        }
+
+        // The _q index that should play after _qi, or -1 at the end.
+        function _nextIndex(m) {
+          if (_qi + 1 < _q.length) return _qi + 1;
+          return m.repeatMode === 2 && _q.length > 0 ? 0 : -1;
+        }
+
+        // MusicKit cannot reorder a live queue without stopping playback (see
+        // vibezSetShuffle), but it only ever needs to know what plays next.
+        // playNext inserts after the current item without interrupting it, so
+        // whenever MusicKit's next item differs from _q's, insert _q's. The
+        // items it displaces stay behind and are never reached, because a
+        // fresh next is inserted again at every track change.
+        //
+        // Measured in the #161 probe (MusicKit 3.2526.0-prerelease): a second
+        // playNext lands in front of the first, queue.items[position + 1]
+        // reflects it as soon as it resolves, and a playNext item crosses the
+        // boundary in 5-31 ms, no slower than a setQueue one. A correction
+        // made with 0.5 s left still landed.
+        //
+        // Chained, so each check reads the queue after the previous insert
+        // has resolved instead of two of them both seeing the stale item.
+        let _syncChain = Promise.resolve();
+        function _syncNext() {
+          _syncChain = _syncChain.then(async () => {
+            const m = _m();
+            if (!_following(m) || _busy || _qi < 0) return;
+            const idx = _nextIndex(m);
+            // Last item with repeat off: MusicKit may still hold a stale next,
+            // and there is no supported way to drop it. _syncQueueIndex stops
+            // it on arrival.
+            if (idx < 0) return;
+            const want = _q[idx];
+            const q    = m.queue;
+            const have = q?.items?.[q.position + 1];
+            if (have?.id === want.id) return;
+            _log(`[js:sync] next is ${have?.id ?? 'nothing'}, want #${idx} ${want.id}`);
+            try { await m.playNext({ items: [want] }); }
+            catch(e) { _log(`[js:sync] playNext failed: ${errName(e)}`); }
+          });
+          return _syncChain;
+        }
+
+        // Set by vibezPrev just before it steps MusicKit back. A step back has
+        // to be asked for: a stale item reached going forward can just as well
+        // be _q[_qi-1].
+        let _stepBack = false;
+
+        // Settle _qi on a track change while following _q. Next, previous and
+        // the repeat-all wrap are the moves _syncNext and vibezPrev set up;
+        // anything else means a correction did not land in time (a reorder
+        // right at the end of a track, a failed playNext, a removed item) and
+        // is rebuilt from _q at the index that should be playing.
+        function _followArrival(m, id) {
+          if (_busy) return; // a rebuild in flight sets _qi itself
+          const back = _stepBack;
+          _stepBack = false;
+          const next = _nextIndex(m);
+          if (_q[_qi]?.id === id) {
+            // same item: repeat-one, or a duplicate event
+          } else if (next >= 0 && _q[next].id === id) {
+            _qi = next;
+          } else if (back && _qi > 0 && _q[_qi - 1].id === id) {
+            _qi--;
+          } else if (next < 0) {
+            _log(`[js:sync] ${id} started past the end of the queue, stopping`);
+            _nativeQueue = false;
+            m.stop().catch(() => {});
+            return;
+          } else {
+            _log(`[js:sync] unexpected ${id}, rebuilding at #${next}`);
+            _playNativeAt(next);
+            return;
+          }
+          _syncNext();
+        }
+
         function _syncQueueIndex() {
           if (!_nativeQueue) return;
-          const id = _m().nowPlayingItem?.id;
+          const m  = _m();
+          const id = m.nowPlayingItem?.id;
           if (!id) return;
+          if (_following(m)) { _followArrival(m, id); return; }
           const idx = _q.findIndex(item => item.id === id);
           if (idx >= 0) { _qi = idx; return; }
           // Playing something that is no longer in _q — it was removed while
           // MusicKit still had it queued. Honour the removal now.
           if (_removedIds.has(id)) {
             _log(`[js:sync] removed item ${id} started — skipping it`);
-            const m = _m();
             if (_nativeHasNext(m)) m.skipToNextItem().catch(() => {});
             // Nothing to skip to: it was the last item MusicKit held, so end the
             // queue rather than let a removed track play it out.
@@ -717,9 +807,37 @@
         const _completedState = (MusicKit.PlaybackStates && MusicKit.PlaybackStates.completed != null)
           ? MusicKit.PlaybackStates.completed
           : 9;
+
+        // A library item inserted by playNext stalled at the boundary 3 times
+        // in 18 in the #161 probe: playbackState sat at waiting at the end of
+        // the current track and never advanced. _catalogForNative avoids most
+        // of those, but uploads have no catalog version. If waiting persists
+        // within a couple of seconds of the end, rebuild from _q at the next
+        // index. Waiting mid-track is ordinary buffering and is left alone.
+        let _stallTimer = null;
+        function _watchStall(m) {
+          clearTimeout(_stallTimer);
+          _stallTimer = null;
+          if (m.playbackState !== 8 /* waiting */ || !_nativeQueue || m.shuffleMode) return;
+          const id = m.nowPlayingItem?.id;
+          _stallTimer = setTimeout(() => {
+            _stallTimer = null;
+            if (_busy || !_nativeQueue || m.playbackState !== 8) return;
+            if (m.nowPlayingItem?.id !== id || _q[_qi]?.id !== id) return;
+            const left = (m.currentPlaybackDuration || 0) - (m.currentPlaybackTime || 0);
+            if (left > 2) return;
+            const next = m.repeatMode === 1 ? _qi : _nextIndex(m);
+            _log(`[js:stall] waiting at the end of #${_qi}, rebuilding at #${next}`);
+            if (next >= 0) { _playNativeAt(next); return; }
+            _nativeQueue = false;
+            m.stop().catch(() => {});
+          }, 3000);
+        }
+
         music.addEventListener('playbackStateDidChange', () => {
           const m = _m();
           _log(`[js:state] ${_stateN[m.playbackState]||m.playbackState}`);
+          _watchStall(m);
           if (m.playbackState !== _completedState) return;
           // In native mode MusicKit advances its own queue and applies its own
           // repeatMode — advancing here as well would advance twice. Only step
@@ -727,11 +845,12 @@
           // of the native queue, or repeat off at the last track).
           if (_nativeQueue && _nativeHasNext(m)) return;
           // Native queue exhausted. Resuming at _qi+1 only means anything while
-          // _q still mirrors that queue — after a shuffle or reorder _qi+1 is an
-          // arbitrary track MusicKit may already have played. Stop cleanly
-          // instead. Safe to drop authority here: MusicKit has nowhere to go.
-          if (_nativeQueue && !_nativeMirrors) {
-            _log('[js:auto] native queue done, order diverged — stopping');
+          // _qi tracks _q, which mirroring and following both guarantee. Under
+          // native shuffle _qi+1 is an arbitrary track MusicKit may already
+          // have played, so stop cleanly instead. Safe to drop authority here:
+          // MusicKit has nowhere to go.
+          if (_nativeQueue && !_nativeMirrors && m.shuffleMode) {
+            _log('[js:auto] native queue done, order shuffled, stopping');
             _nativeQueue = false;
             return;
           }
@@ -772,12 +891,14 @@
           catch(e) { _log(`[js:pause] error: ${errName(e)}`); goError('pause: '+errName(e)).catch(()=>{}); }
         };
         // While MusicKit owns the queue, let it do the moving and let
-        // _syncQueueIndex resettle _qi afterwards: once its order has diverged
-        // from _q (shuffle, reorder) _qi ± 1 is not the neighbouring item, so
-        // the bounds have to come from MusicKit's queue rather than from _q.
+        // _syncQueueIndex resettle _qi afterwards: under native shuffle _qi ± 1
+        // is not the neighbouring item, so the bounds have to come from
+        // MusicKit's queue rather than from _q.
         window.vibezNext  = () => {
           const m = _m();
           _log(`[js:next] _qi=${_qi} len=${_q.length} busy=${_busy} native=${_nativeQueue}`);
+          // Following _q, MusicKit's next past the end of _q is a stale item.
+          if (_following(m) && _nextIndex(m) < 0) { _log('[js:next] already at end of queue'); return; }
           if (_nativeQueue && _nativeHasNext(m)) {
             m.skipToNextItem().catch(e => goError('next: '+errName(e)).catch(()=>{}));
             return;
@@ -788,6 +909,22 @@
         window.vibezPrev  = () => {
           const m = _m();
           _log(`[js:prev] _qi=${_qi} native=${_nativeQueue}`);
+          // Following _q, MusicKit's history is what played, which is not
+          // _q[_qi-1] after a reorder. Step back natively only when the two
+          // agree; otherwise rebuild there.
+          if (_following(m)) {
+            const q = m.queue;
+            if (_qi > 0 && q?.position > 0 && q.items?.[q.position - 1]?.id === _q[_qi - 1].id) {
+              _stepBack = true;
+              m.skipToPreviousItem().catch(e => {
+                _stepBack = false;
+                goError('previous: '+errName(e)).catch(()=>{});
+              });
+            } else {
+              _playNativeAt(Math.max(_qi - 1, 0));
+            }
+            return;
+          }
           if (_nativeQueue && (m.queue?.position ?? 0) > 0) {
             m.skipToPreviousItem().catch(e => goError('previous: '+errName(e)).catch(()=>{}));
             return;
@@ -893,6 +1030,7 @@
               }
               _log(`[js:shuffle] restored original order, _qi=${_qi}`);
             }
+            _syncNext(); // MusicKit's unshuffled next is its own order, not _q's
           }
         };
         let _qUnshuffled = []; // original order snapshot while shuffle is on
@@ -957,7 +1095,7 @@
               // the queue (#96 probe, phase F), which is the sanctioned way to
               // extend one that is already playing. queue.append throws
               // TypeError. items: again, so a library append is expressible.
-              try { await _m().playLater({ items: items.slice() }); _warmLibItems(); }
+              try { await _m().playLater({ items: items.slice() }); _warmLibItems(); _syncNext(); }
               catch(e) {
                 // Keep _nativeQueue set: MusicKit still owns the items it does
                 // have, and clearing it would double up on the next boundary.
@@ -995,6 +1133,7 @@
               _nativeMirrors = false;
               try { await _m().playLater({ items: insert.slice() }); }
               catch(e2) { _log(`[js:playNext] playLater failed too: ${errName(e2)}`); }
+              _syncNext();
             }
           } catch(e) { goError('playNext failed: '+errName(e)).catch(()=>{}); }
         };
@@ -1061,6 +1200,7 @@
               _removedIds.add(removed.id);
             }
             _nativeMirrors = false;
+            _syncNext();
           }
         };
 
@@ -1068,9 +1208,9 @@
           const from = parseInt(fromStr);
           const to   = parseInt(toStr);
           if (from < 0 || from >= _q.length || to < 0 || to >= _q.length || from === to) return;
-          // _nativeQueue is deliberately left alone, and in native mode this
-          // reorders the view only — see vibezSetShuffle for the measurement
-          // showing a live queue cannot be reordered without stopping playback.
+          // _nativeQueue is deliberately left alone: a live queue cannot be
+          // reordered without stopping playback (see vibezSetShuffle), so the
+          // move lands in _q and _syncNext makes MusicKit's next item follow.
           _nativeMirrors = false;
           const name = _q[from]?.attributes?.name || '?';
           _log(`[js:move] #${from} → #${to} "${name}"`);
@@ -1079,6 +1219,7 @@
           if (_qi === from)                 _qi = to;
           else if (from < _qi && to >= _qi) _qi--;
           else if (from > _qi && to <= _qi) _qi++;
+          _syncNext();
         };
 
         window.vibezQueueClear = function() {
