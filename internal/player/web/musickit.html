@@ -975,20 +975,53 @@
             if (items.length === 0) { _log('[js:playNext] no items resolved — skip'); return; }
             for (const item of items) _removedIds.delete(item.id); // re-added: play it
             if (_qi < 0) { _q = _q.concat(items); _playAt(0); return; } // nothing playing
-            _q.splice(_qi + 1, 0, ...items);
-            _log(`[js:playNext] +${items.length} at #${_qi + 1} → _q.length=${_q.length}`);
+            const insert = _nativeQueue ? await _catalogForNative(items) : items;
+            _q.splice(_qi + 1, 0, ...insert);
+            _log(`[js:playNext] +${insert.length} at #${_qi + 1} → _q.length=${_q.length}`);
             if (!_nativeQueue) return; // one-item mode advances through _q itself
-            try { await _m().playNext({ items: items.slice() }); _warmLibItems(); }
+            try { await _m().playNext({ items: insert.slice() }); _warmLibItems(); }
             catch(e) {
               // Same fallback as vibezAppendQueue: MusicKit gets them at the
               // end, and _q no longer mirrors its order.
               _log(`[js:playNext] native playNext failed: ${errName(e)} — appending`);
               _nativeMirrors = false;
-              try { await _m().playLater({ items: items.slice() }); }
+              try { await _m().playLater({ items: insert.slice() }); }
               catch(e2) { _log(`[js:playNext] playLater failed too: ${errName(e2)}`); }
             }
           } catch(e) { goError('playNext failed: '+errName(e)).catch(()=>{}); }
         };
+
+        // A library item that playNext inserts into a live queue can stall at
+        // the boundary: 3 of 18 crossings in the #161 probe, against 0 of 8 for
+        // the same item placed by setQueue. Swap in the catalog version where
+        // one resolves as playable, and record the pair in _libMap and
+        // _libItems so a CONTENT_UNAVAILABLE fallback still finds the library
+        // copy. Anything without a playable catalog version stays as it is.
+        async function _catalogForNative(items) {
+          const want = items.map(i => i.id.startsWith('i.') ? i.attributes?.playParams?.catalogId : null);
+          const ids  = [...new Set(want.filter(Boolean))];
+          if (ids.length === 0) return items;
+          const byId = {};
+          try {
+            const sf = _m().storefrontId || 'us';
+            const r  = await _m().api.music(`/v1/catalog/${sf}/songs`, { ids });
+            for (const s of r?.data?.data ?? []) {
+              const pp = s.attributes?.playParams;
+              if (pp && pp.id && pp.kind === 'song') byId[s.id] = s;
+            }
+          } catch(e) {
+            _log(`[js:playNext] catalog lookup failed: ${errName(e)}, keeping library items`);
+            return items;
+          }
+          return items.map((item, k) => {
+            const cat = want[k] && byId[want[k]];
+            if (!cat) return item;
+            _libMap[cat.id]    = item.id;
+            _libItems[item.id] = item;
+            _removedIds.delete(cat.id); // re-added under its catalog ID
+            return cat;
+          });
+        }
 
         window.vibezQueueRemove = function(idxStr) {
           const idx = parseInt(idxStr);

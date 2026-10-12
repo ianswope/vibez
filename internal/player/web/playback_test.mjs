@@ -63,9 +63,20 @@ test('native setQueue auto-play does not trigger a duplicate play and fallback',
 });
 
 // ─── vibezQueuePlayNext (#161) ───────────────────────────────────────────────
-function setupPlayNext({ native, mirrors = true, qi = 1, playNextFails = false } = {}) {
+const libSongs = {
+ 'i.L1': { id: 'i.L1', attributes: { playParams: { id: 'i.L1', kind: 'song', catalogId: '901' } } },
+ 'i.U1': { id: 'i.U1', attributes: { playParams: { id: 'i.U1', kind: 'song' } } }, // upload, no catalog copy
+};
+const catalogSong = id => ({ id, attributes: { playParams: { id, kind: 'song' } } });
+function setupPlayNext({ native, mirrors = true, qi = 1, playNextFails = false, catalog = {}, lookupFails = false } = {}) {
  const calls = [];
  const m = {
+  storefrontId: 'us',
+  api: { async music(path, { ids }) {
+   calls.push(['lookup', ids.join(',')]);
+   if (lookupFails) throw new Error('offline');
+   return { data: { data: ids.filter(id => catalog[id]).map(id => catalog[id]) } };
+  } },
   async playNext(d) { calls.push(['playNext', d.items.map(i => i.id).join(',')]); if (playNextFails) throw new Error('nope'); },
   async playLater(d) { calls.push(['playLater', d.items.map(i => i.id).join(',')]); },
  };
@@ -73,7 +84,8 @@ function setupPlayNext({ native, mirrors = true, qi = 1, playNextFails = false }
   window: {}, _m: () => m, _log: () => {},
   _q: [{id:'a'}, {id:'b'}, {id:'c'}], _qi: qi,
   _nativeQueue: native, _nativeMirrors: mirrors, _removedIds: new Set(['x']),
-  _resolveItems: async ids => ids.map(id => ({id})),
+  _libMap: {}, _libItems: {},
+  _resolveItems: async ids => ids.map(id => libSongs[id] ?? {id}),
   _playAt: idx => calls.push(['playAt', idx]), _warmLibItems: () => {},
   errName: e => e.message, goError: () => Promise.resolve(),
  };
@@ -107,4 +119,30 @@ test('playNext with nothing playing appends and starts', async () => {
  await env.window.vibezQueuePlayNext('["x"]');
  assert.equal(ids(), 'a,b,c,x');
  assert.deepEqual(calls.map(c => c.join(':')), ['playAt:0']);
+});
+test('playNext in native mode swaps a library item for its playable catalog version', async () => {
+ const { env, calls, ids } = setupPlayNext({ native: true, catalog: { '901': catalogSong('901') } });
+ await env.window.vibezQueuePlayNext('["i.L1","i.U1","x"]');
+ assert.equal(ids(), 'a,b,901,i.U1,x,c', '_q must hold the same objects MusicKit does');
+ assert.deepEqual(calls.map(c => c.join(':')), ['lookup:901', 'playNext:901,i.U1,x']);
+ assert.equal(env._libMap['901'], 'i.L1', 'CONTENT_UNAVAILABLE fallback must still find the library copy');
+ assert.equal(env._libItems['i.L1'].id, 'i.L1');
+});
+test('playNext keeps the library item when the catalog version is not playable', async () => {
+ const { env, calls, ids } = setupPlayNext({ native: true, catalog: {} });
+ await env.window.vibezQueuePlayNext('["i.L1"]');
+ assert.equal(ids(), 'a,b,i.L1,c');
+ assert.deepEqual(calls.map(c => c.join(':')), ['lookup:901', 'playNext:i.L1']);
+});
+test('playNext keeps library items when the catalog lookup fails', async () => {
+ const { env, calls, ids } = setupPlayNext({ native: true, lookupFails: true });
+ await env.window.vibezQueuePlayNext('["i.L1"]');
+ assert.equal(ids(), 'a,b,i.L1,c');
+ assert.deepEqual(calls.map(c => c.join(':')), ['lookup:901', 'playNext:i.L1']);
+});
+test('playNext in one-item mode does not swap library items', async () => {
+ const { env, calls, ids } = setupPlayNext({ native: false, catalog: { '901': catalogSong('901') } });
+ await env.window.vibezQueuePlayNext('["i.L1"]');
+ assert.equal(ids(), 'a,b,i.L1,c');
+ assert.equal(calls.length, 0);
 });
