@@ -1,0 +1,359 @@
+<!DOCTYPE html>
+<!--
+  PROTOTYPE INSTRUMENT, issue #161 (keep MusicKit's next item in sync with _q).
+  Not shipped.
+
+  Simone's proposal: leave the live native queue alone and, after every track
+  change or queue edit, playNext() the item vibez expects next. Questions:
+
+    Q1. A second playNext within the same track: does it land in front of the
+        first one or behind it? Checked in the queue view AND by skipping.
+    Q2. Do queue.items / queue.item(i) expose the item at position + 1, and do
+        they reflect a playNext insertion straight away?
+    Q3. What is the boundary gap when the next item was inserted by playNext,
+        for a catalog item and for a library item, against a plain native
+        queue as the control?
+    Q4. A correction made ~1.5s before the boundary: does it still land?
+
+  The native queue is built the way musickit.html builds it:
+  setQueue({items: resolvedObjects}).
+-->
+<html>
+  <head><meta charset="utf-8"><title>vibez next-sync probe</title></head>
+  <body>
+    <script>
+      window.addEventListener('error',   (e) => window.__fail?.(e.message || 'window error'));
+      window.addEventListener('unhandledrejection', (e) => window.__fail?.(String(e.reason)));
+    </script>
+    <script>
+      document.addEventListener('musickitloaded', async function () {
+        const RESULT = { musickitVersion: null, phases: [], errors: [] };
+        const errStr = (e) => (e && (e.name ? e.name + (e.message ? ': ' + e.message : '') : e.message)) || String(e);
+        const fail = (stage, e) => { RESULT.errors.push({ stage, error: errStr(e) }); };
+        window.__fail = (msg) => { fail('window', msg); };
+        let flushed = false;
+        const flush = () => {
+          if (flushed) return;
+          flushed = true;
+          goProbeResult(JSON.stringify(RESULT)).catch(() => {});
+        };
+
+        try {
+          await MusicKit.configure({
+            developerToken: '{{.DeveloperToken}}',
+            app: { name: 'vibez-probe', build: 'probe' },
+          });
+          const m = () => MusicKit.getInstance();
+          if ('{{.UserToken}}') m().musicUserToken = '{{.UserToken}}';
+          RESULT.musickitVersion = MusicKit.version || null;
+          RESULT.storefront = m().storefrontId || null;
+
+          // ── instrumentation (same method as probe_items.html) ─────────────
+          const mediaSnapshot = () => Array.from(document.querySelectorAll('audio,video')).map((el, i) => ({
+            i, ct: +(el.currentTime || 0).toFixed(3), paused: !!el.paused,
+            src: (el.currentSrc || '').slice(-28) || null,
+          }));
+          let timeline = [], t0 = 0, poll = null;
+          const stamp = (kind) => {
+            const inst = m();
+            timeline.push({
+              t: +(performance.now() - t0).toFixed(1), kind,
+              itemId: inst.nowPlayingItem?.id ?? null,
+              qpos: inst.queue?.position, media: mediaSnapshot(),
+            });
+          };
+          const onItem = () => stamp('nowPlayingItemDidChange');
+          const startRecording = () => {
+            timeline = []; t0 = performance.now();
+            m().addEventListener('nowPlayingItemDidChange', onItem);
+            poll = setInterval(() => stamp('poll'), 50);
+          };
+          const stopRecording = () => {
+            clearInterval(poll);
+            m().removeEventListener('nowPlayingItemDidChange', onItem);
+            return timeline.slice();
+          };
+          const deriveGapMedia = (tl, firstId) => {
+            let prev = null, lastA = null, firstB = null;
+            const advancing = (e) => {
+              if (!prev || !prev.media || !e.media) return false;
+              for (const cur of e.media) {
+                const p = prev.media.find(x => x.i === cur.i && x.src === cur.src);
+                if (p && !cur.paused && cur.ct - p.ct > 0.002) return true;
+              }
+              return false;
+            };
+            for (const e of tl) {
+              if (advancing(e)) {
+                if (e.itemId === firstId) lastA = e.t;
+                else if (e.itemId && lastA !== null && firstB === null) firstB = e.t;
+              }
+              prev = e;
+            }
+            return (lastA !== null && firstB !== null)
+              ? { gapMs: +(firstB - lastA).toFixed(1) }
+              : { gapMs: null, note: 'could not observe media advancing on both tracks' };
+          };
+
+          const waitFor = (pred, ms) => new Promise(res => {
+            const iv = setInterval(() => { if (pred()) { clearInterval(iv); clearTimeout(to); res(true); } }, 40);
+            const to = setTimeout(() => { clearInterval(iv); res(false); }, ms);
+          });
+          const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+          const settle = async () => { try { await m().stop(); } catch (_) {} await sleep(600); };
+          const playIfNeeded = async () => { if (m().playbackState !== 2) await m().play(); };
+          const nowId = () => m().nowPlayingItem?.id ?? null;
+          const queueView = () => {
+            const q = m().queue;
+            const pos = q?.position ?? null;
+            const items = q?.items ?? [];
+            let viaItemFn = 'n/a';
+            if (q && typeof q.item === 'function') {
+              try { viaItemFn = q.item(pos + 1)?.id ?? null; } catch (e) { viaItemFn = 'threw: ' + errStr(e); }
+            }
+            return {
+              length: q?.length ?? null, position: pos,
+              ids: items.map(i => i.id),
+              atPosition: items[pos]?.id ?? null,
+              nextViaItems: items[pos + 1]?.id ?? null,
+              nextViaItemFn: viaItemFn,
+              nextItemProp: q?.nextPlayableItem?.id ?? null,
+              nowPlaying: nowId(),
+            };
+          };
+          // Start a native queue and wait until the first item is audibly playing.
+          const startQueue = async (items) => {
+            await m().setQueue({ items });
+            await playIfNeeded();
+            return waitFor(() => m().playbackState === 2, 20000);
+          };
+          // Seek near the end of the current track, let MusicKit cross the
+          // boundary on its own, and measure the gap.
+          const crossBoundary = async (ph, leadS, beforeCross) => {
+            const firstId = nowId();
+            startRecording();
+            const dur = (m().nowPlayingItem?.attributes?.durationInMillis ?? 0) / 1000;
+            if (dur > leadS + 2) m().seekToTime(Math.max(0, dur - leadS));
+            if (beforeCross) await beforeCross();
+            const changed = await waitFor(() => nowId() !== firstId, (leadS + 25) * 1000);
+            await sleep(TAIL_MS);
+            const tl = stopRecording();
+            ph.advancedOnItsOwn = changed;
+            ph.durS = +dur.toFixed(1);
+            ph.timeAtEnd = +(m().currentPlaybackTime ?? 0).toFixed(2);
+            ph.stateAtEnd = m().playbackState;
+            ph.lastMedia = tl.length ? tl[tl.length - 1].media : null;
+            ph.crossedTo = nowId();
+            ph.gap = deriveGapMedia(tl, firstId);
+            ph.queueAfterCross = queueView();
+          };
+
+          const IDS = {{.IDsJSON}};
+          const LEAD_S = {{.LeadSeconds}};
+          const TAIL_MS = {{.TailMs}};
+          const REPS = {{.Reps}};
+          const sf = m().storefrontId || '{{.Storefront}}' || 'us';
+
+          let catalog = [];
+          try {
+            const r = await m().api.music(`/v1/catalog/${sf}/songs`, { ids: IDS, include: 'library' });
+            catalog = r?.data?.data ?? [];
+            RESULT.resolvedCatalog = catalog.map(s => ({
+              id: s.id, name: s.attributes?.name,
+              durS: Math.round((s.attributes?.durationInMillis ?? 0) / 1000),
+              libraryId: s.relationships?.library?.data?.[0]?.id ?? null,
+            }));
+          } catch (e) { fail('resolve-catalog', e); flush(); return; }
+          if (catalog.length < 5) { fail('resolve-catalog', 'need >=5 catalog songs, got ' + catalog.length); flush(); return; }
+          const [A, B, C, D, E] = catalog;
+
+          // A library item to insert: the library copy of C if the account owns
+          // one (isolates item kind), otherwise any library song.
+          let libItem = null;
+          try {
+            const cLib = RESULT.resolvedCatalog[2].libraryId;
+            if (cLib) {
+              const lr = await m().api.music(`/v1/me/library/songs/${cLib}`);
+              libItem = lr?.data?.data?.[0] ?? null;
+              RESULT.libraryItemSource = 'library copy of C';
+            }
+            if (!libItem) {
+              const lr = await m().api.music('/v1/me/library/songs', { limit: 1 });
+              libItem = lr?.data?.data?.[0] ?? null;
+              RESULT.libraryItemSource = libItem ? 'first library song' : null;
+            }
+            RESULT.libraryItem = libItem ? { id: libItem.id, name: libItem.attributes?.name } : null;
+          } catch (e) { fail('library-item', e); }
+
+          const runPhase = async (name, fn) => {
+            const ph = { name };
+            await settle();
+            try { await fn(ph); } catch (e) { ph.error = errStr(e); }
+            RESULT.phases.push(ph);
+          };
+
+          // ── Library control: [A, library copy of C] via setQueue, no playNext.
+          // Separates "playNext-inserted library item" from "library item".
+          // ── Library playNext with recovery: on a stall near the end of A,
+          // try skipToNextItem and record whether the library item then plays.
+          if ('{{.Only}}' === 'librecover') {
+            for (let i = 0; i < REPS; i++) {
+              await runPhase(`librecover playNext(LIB) #${i + 1}`, async (ph) => {
+                if (!(await startQueue([A, B]))) { ph.note = 'never reached playing'; return; }
+                await m().playNext({ items: [libItem] });
+                const firstId = nowId();
+                const dur = (m().nowPlayingItem?.attributes?.durationInMillis ?? 0) / 1000;
+                startRecording();
+                m().seekToTime(Math.max(0, dur - LEAD_S));
+                // Crossed, or stalled at the very end for 2s.
+                let stalledSince = null;
+                await waitFor(() => {
+                  if (nowId() !== firstId) return true;
+                  const atEnd = (m().currentPlaybackTime ?? 0) >= dur - 1;
+                  if (atEnd && m().playbackState === 8) {
+                    stalledSince ??= performance.now();
+                    return performance.now() - stalledSince > 2000;
+                  }
+                  stalledSince = null;
+                  return false;
+                }, (LEAD_S + 25) * 1000);
+                ph.crossedNaturally = nowId() !== firstId;
+                if (!ph.crossedNaturally) {
+                  ph.stalled = m().playbackState === 8;
+                  const t = performance.now();
+                  try { await m().skipToNextItem(); } catch (e) { ph.skipError = errStr(e); }
+                  ph.recovered = await waitFor(() => nowId() === libItem.id && m().playbackState === 2, 15000);
+                  ph.recoverMs = Math.round(performance.now() - t);
+                  ph.stateAfter = m().playbackState;
+                  ph.nowAfter = nowId();
+                }
+                await sleep(1500);
+                const tl = stopRecording();
+                ph.mediaAdvancingOnLib = (() => {
+                  const libTl = tl.filter(e => e.itemId === libItem.id);
+                  for (let j = 1; j < libTl.length; j++)
+                    for (const cur of libTl[j].media)
+                      { const p = libTl[j-1].media.find(x => x.i === cur.i && x.src === cur.src);
+                        if (p && !cur.paused && cur.ct - p.ct > 0.002) return true; }
+                  return false;
+                })();
+              });
+            }
+            await settle();
+            flush();
+            return;
+          }
+
+          if ('{{.Only}}' === 'libctl') {
+            for (let i = 0; i < REPS; i++) {
+              await runPhase(`libctl setQueue [A, LIB] natural boundary #${i + 1}`, async (ph) => {
+                if (!(await startQueue([A, libItem]))) { ph.note = 'never reached playing'; return; }
+                ph.queueBefore = queueView();
+                await crossBoundary(ph, LEAD_S);
+                ph.expected = libItem.id;
+                ph.landed = ph.crossedTo === libItem.id;
+              });
+            }
+            await settle();
+            flush();
+            return;
+          }
+
+          // ── CONTROL: plain native queue [A,B], natural boundary ───────────
+          for (let i = 0; i < REPS; i++) {
+            await runPhase(`control [A,B] natural boundary #${i + 1}`, async (ph) => {
+              if (!(await startQueue([A, B]))) { ph.note = 'never reached playing'; return; }
+              ph.queueBefore = queueView();
+              await crossBoundary(ph, LEAD_S);
+              ph.expected = B.id;
+            });
+          }
+
+          // ── Q2: what the queue exposes, before and after a playNext ───────
+          await runPhase('Q2 queue view [A,B,C], then skip, then playNext(D)', async (ph) => {
+            if (!(await startQueue([A, B, C]))) { ph.note = 'never reached playing'; return; }
+            ph.atStart = queueView();
+            await m().skipToNextItem();
+            await waitFor(() => nowId() === B.id && m().playbackState === 2, 15000);
+            ph.afterSkip = queueView();
+            await m().playNext({ items: [D] });
+            ph.afterPlayNextImmediate = queueView();
+            await sleep(500);
+            ph.afterPlayNext500ms = queueView();
+            ph.stillPlayingB = nowId() === B.id && m().playbackState === 2;
+          });
+
+          // ── Q1: two playNext calls within one track ───────────────────────
+          await runPhase('Q1 [A,B,C] playing A, playNext(D) then playNext(E)', async (ph) => {
+            if (!(await startQueue([A, B, C]))) { ph.note = 'never reached playing'; return; }
+            await m().playNext({ items: [D] });
+            ph.afterFirst = queueView();
+            await m().playNext({ items: [E] });
+            ph.afterSecond = queueView();
+            ph.viewSaysNext = ph.afterSecond.nextViaItems === E.id ? 'E (second lands in front)'
+              : ph.afterSecond.nextViaItems === D.id ? 'D (second stacks behind)' : ph.afterSecond.nextViaItems;
+            // Ground truth: what actually plays, three skips in.
+            const played = [];
+            for (let i = 0; i < 3; i++) {
+              const before = nowId();
+              await m().skipToNextItem();
+              await waitFor(() => nowId() !== before && m().playbackState === 2, 15000);
+              played.push(nowId());
+            }
+            ph.playedAfterSkips = played;
+            ph.expectIfFront = [E.id, D.id, B.id];
+            ph.expectIfBehind = [D.id, E.id, B.id];
+          });
+
+          // ── Q3a: catalog item inserted by playNext, natural boundary ──────
+          for (let i = 0; i < REPS; i++) {
+            await runPhase(`Q3 [A,B] + playNext(C catalog), natural boundary #${i + 1}`, async (ph) => {
+              if (!(await startQueue([A, B]))) { ph.note = 'never reached playing'; return; }
+              await m().playNext({ items: [C] });
+              ph.queueBefore = queueView();
+              await crossBoundary(ph, LEAD_S);
+              ph.expected = C.id;
+              ph.landed = ph.crossedTo === C.id;
+            });
+          }
+
+          // ── Q3b: library item inserted by playNext, natural boundary ──────
+          for (let i = 0; i < REPS; i++) {
+            if (!libItem) {
+              RESULT.phases.push({ name: `Q3 [A,B] + playNext(library), natural boundary #${i + 1}`, skipped: 'no library song' });
+              continue;
+            }
+            await runPhase(`Q3 [A,B] + playNext(library), natural boundary #${i + 1}`, async (ph) => {
+              if (!(await startQueue([A, B]))) { ph.note = 'never reached playing'; return; }
+              await m().playNext({ items: [libItem] });
+              ph.queueBefore = queueView();
+              await crossBoundary(ph, LEAD_S);
+              ph.expected = libItem.id;
+              ph.landed = ph.crossedTo === libItem.id;
+            });
+          }
+
+          // ── Q4: correction ~1.5s before the boundary ──────────────────────
+          await runPhase('Q4 [A,B], playNext(C) 1.5s before the boundary', async (ph) => {
+            if (!(await startQueue([A, B]))) { ph.note = 'never reached playing'; return; }
+            await crossBoundary(ph, LEAD_S, async () => {
+              const dur = (m().nowPlayingItem?.attributes?.durationInMillis ?? 0) / 1000;
+              await waitFor(() => (m().currentPlaybackTime ?? 0) >= dur - 1.5, (LEAD_S + 5) * 1000);
+              ph.insertedAtRemainingS = +(dur - (m().currentPlaybackTime ?? 0)).toFixed(2);
+              await m().playNext({ items: [C] });
+            });
+            ph.expected = C.id;
+            ph.landed = ph.crossedTo === C.id;
+          });
+
+          await settle();
+          flush();
+        } catch (e) {
+          fail('top', e);
+          flush();
+        }
+      });
+    </script>
+    <script src="https://js-cdn.music.apple.com/musickit/v3/musickit.js" data-web-components async></script>
+  </body>
+</html>
