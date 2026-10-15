@@ -46,6 +46,12 @@ type Player struct {
 
 // New creates a CDP Player. EnsureBrowser must be called once before New().
 func New(devToken, userToken, storefront string, wsl bool, audioBitrateKbps int) (*Player, error) {
+	// The storefront is passed only alongside a saved session, when the startup
+	// check has just confirmed it against /v1/me/storefront. Without one it may
+	// be stale, and MusicKit resolves it in authorize() (#163).
+	if userToken == "" {
+		storefront = ""
+	}
 	// The user token is deliberately not rendered into the page: anything that
 	// can fetch the page from the local server would otherwise get it. The page
 	// asks for it over the goGetUserToken binding instead.

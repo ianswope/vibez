@@ -71,6 +71,12 @@ type Player struct {
 // New creates a Player and loads MusicKit JS into a fully hidden WebView.
 // Call Run() on the main OS goroutine to start the GTK event loop.
 func New(devToken, userToken, storefront string, audioBitrateKbps int) (*Player, error) {
+	// The storefront is passed only alongside a saved session, when the startup
+	// check has just confirmed it against /v1/me/storefront. Without one it may
+	// be stale, and MusicKit resolves it in authorize() (#163).
+	if userToken == "" {
+		storefront = ""
+	}
 	html, err := web.RenderHTML(devToken, userToken, storefront, "1.0.0", audioBitrateKbps)
 	if err != nil {
 		return nil, err

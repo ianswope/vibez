@@ -46,7 +46,7 @@ func runCDPFlow(cfg *config.Config, opts tui.Options, onUserToken, onStorefront 
 		devTokenRejected := false
 		if cfg.AppleUserToken != "" {
 			prog.Send(tui.InitStatusMsg("Checking Apple Music session..."))
-			switch auth.CheckTokens(cfg.AppleDeveloperToken, cfg.AppleUserToken) {
+			switch status, sf := auth.CheckTokens(cfg.AppleDeveloperToken, cfg.AppleUserToken); status {
 			case auth.UserTokenRejected:
 				prog.Send(tui.InitStatusMsg("Session expired - re-authenticating..."))
 				cfg.AppleUserToken = ""
@@ -73,6 +73,10 @@ func runCDPFlow(cfg *config.Config, opts tui.Options, onUserToken, onStorefront 
 				}
 				prog.Send(tui.InitStatusMsg(status))
 			case auth.TokensValid:
+				// The same request reported the account's storefront. Save it before
+				// the player page renders: on a saved token the page's own value is
+				// MusicKit's default, not the account's (#163).
+				onStorefront(sf)
 			}
 		}
 
@@ -97,6 +101,11 @@ func runCDPFlow(cfg *config.Config, opts tui.Options, onUserToken, onStorefront 
 			if err := auth.Login(cfg); err != nil {
 				prog.Send(tui.InitErrMsg{Err: fmt.Errorf("authentication: %w", err)})
 				return
+			}
+			// A fresh session has no storefront in config yet. The check that
+			// validates returning sessions reports it.
+			if _, sf := auth.CheckTokens(cfg.AppleDeveloperToken, cfg.AppleUserToken); sf != "" {
+				onStorefront(sf)
 			}
 		}
 

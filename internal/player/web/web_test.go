@@ -77,3 +77,42 @@ func TestRenderHTMLWithoutUserTokenHoldsNoSecret(t *testing.T) {
 		t.Error("user token leaked into rendered HTML")
 	}
 }
+
+// On a saved token MusicKit never fetches /v1/me/storefront, so storefrontId
+// is its localStorage value or its default "us" until the first /v1/me/account
+// call sets storefrontCountryCode and raises storefrontCountryCodeDidChange.
+// storefrontIdentifierDidChange belongs to a different property that never
+// fires on this page, and a page listening to it saved "us" over every non-US
+// account's storefront on each relaunch (#163).
+func TestRenderHTMLListensForStorefrontCountryCode(t *testing.T) {
+	html, err := RenderHTML("dev", "user", "us", "test", 256)
+	if err != nil {
+		t.Fatalf("RenderHTML: %v", err)
+	}
+	if !strings.Contains(html, "addEventListener('storefrontCountryCodeDidChange'") {
+		t.Error("rendered HTML does not listen for storefrontCountryCodeDidChange")
+	}
+	if strings.Contains(html, "addEventListener('storefrontIdentifierDidChange'") {
+		t.Error("rendered HTML still listens for storefrontIdentifierDidChange, which never fires with a saved token")
+	}
+}
+
+// Go passes a storefront only alongside a saved session, once the startup
+// check has confirmed it. The page then starts MusicKit on it, so its own
+// catalog lookups use the account's storefront from the first request.
+func TestRenderHTMLConfiguresStorefrontOnlyWhenGiven(t *testing.T) {
+	html, err := RenderHTML("dev", "", "ar", "test", 256)
+	if err != nil {
+		t.Fatalf("RenderHTML: %v", err)
+	}
+	if !strings.Contains(html, "configOpts.storefrontId = 'ar'") {
+		t.Error("rendered HTML does not configure MusicKit with the given storefront")
+	}
+	html, err = RenderHTML("dev", "", "", "test", 256)
+	if err != nil {
+		t.Fatalf("RenderHTML: %v", err)
+	}
+	if strings.Contains(html, "configOpts.storefrontId =") {
+		t.Error("rendered HTML configures a storefront when none was given")
+	}
+}

@@ -79,9 +79,9 @@ type storefrontResponse struct {
 	} `json:"data"`
 }
 
-// storefront returns the user's Apple Music storefront ID.
-// If the config has an explicit override it is used directly; otherwise the
-// value reported by Apple's /v1/me/storefront endpoint is fetched and cached.
+// storefront returns the user's Apple Music storefront ID: the one the startup
+// session check saved to config, or failing that the value reported by Apple's
+// /v1/me/storefront endpoint, fetched once and cached.
 func (a *AppleProvider) storefront(ctx context.Context) (string, error) {
 	if a.cfg.StoreFront != "" {
 		return a.cfg.StoreFront, nil
