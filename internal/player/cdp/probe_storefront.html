@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<!--
+  PROTOTYPE INSTRUMENT, issue #163 (storefront reverts to "us" on relaunch).
+  Not shipped.
+
+  musickit.html applies a saved user token without calling authorize(), then
+  reads music.storefrontId and hands it to Go, which saves it in config.json.
+  This page does the same three calls and records what MusicKit reports.
+
+    Q1. What is music.storefrontId right after the token is set, and is
+        /v1/me/storefront requested at all on that path?
+    Q2. Which events fire: storefrontIdentifierDidChange (what vibez listens
+        to) or storefrontCountryCodeDidChange (what vibez ignores)?
+    Q3. With MusicKit's own persisted key (music.<team>.itua) seeded to another
+        country before configure, does storefrontId report the seed for an
+        account that lives in a different storefront?
+    Q4. What do me() (the first play's path) and requestStorefrontCountryCode()
+        (authorize's path) change, and which event does the change raise?
+-->
+<html>
+  <head><meta charset="utf-8"><title>vibez storefront probe</title></head>
+  <body>
+    <script>
+      window.addEventListener('error',   (e) => window.__fail?.(e.message || 'window error'));
+      window.addEventListener('unhandledrejection', (e) => window.__fail?.(String(e.reason)));
+    </script>
+    <script>
+      // Runs before musickit.js loads: seed MusicKit's persisted storefront.
+      (function () {
+        const seed = '{{.Seed}}';
+        if (!seed) return;
+        try {
+          const payload = '{{.DeveloperToken}}'.split('.')[1].replace(/-/g, '+').replace(/_/g, '/');
+          const teamId = JSON.parse(atob(payload)).iss;
+          localStorage.setItem('music.' + String(teamId).toLowerCase() + '.itua', seed);
+        } catch (e) { window.__seedError = String(e); }
+      })();
+    </script>
+    <script>
+      document.addEventListener('musickitloaded', async function () {
+        const RESULT = { musickitVersion: null, seed: '{{.Seed}}', seedError: window.__seedError || null,
+                         steps: [], events: [], errors: [] };
+        const t0 = performance.now();
+        const now = () => +(performance.now() - t0).toFixed(1);
+        const errStr = (e) => (e && (e.name ? e.name + (e.message ? ': ' + e.message : '') : e.message)) || String(e);
+        const fail = (stage, e) => { RESULT.errors.push({ stage, error: errStr(e) }); };
+        window.__fail = (msg) => { fail('window', msg); };
+        let flushed = false;
+        const flush = () => {
+          if (flushed) return;
+          flushed = true;
+          goProbeResult(JSON.stringify(RESULT)).catch(() => {});
+        };
+        const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+        const inst = () => { try { return MusicKit.getInstance(); } catch (_) { return null; } };
+        const snap = (stage, extra) => {
+          const m = inst();
+          const keys = Object.keys(localStorage).filter((k) => k.startsWith('music.'));
+          const itua = keys.find((k) => k.endsWith('.itua'));
+          RESULT.steps.push(Object.assign({
+            t: now(), stage,
+            storefrontId: m ? (m.storefrontId ?? null) : null,
+            storefrontCountryCode: m ? (m.storefrontCountryCode ?? null) : null,
+            isAuthorized: m ? !!m.isAuthorized : null,
+            storedItua: itua ? localStorage.getItem(itua) : null,
+            storageKeys: keys.map((k) => k.replace(/^music\.[^.]+\./, 'music.<team>.')),
+          }, extra || {}));
+        };
+
+        try {
+          snap('before configure');
+          const music = await MusicKit.configure({
+            developerToken: '{{.DeveloperToken}}',
+            app: { name: 'vibez-probe', build: 'probe' },
+          });
+          RESULT.musickitVersion = MusicKit.version || null;
+          for (const ev of ['storefrontIdentifierDidChange', 'storefrontCountryCodeDidChange',
+                            'authorizationStatusDidChange', 'userTokenDidChange']) {
+            music.addEventListener(ev, () => {
+              RESULT.events.push({ t: now(), event: ev,
+                storefrontId: music.storefrontId ?? null,
+                storefrontCountryCode: music.storefrontCountryCode ?? null });
+            });
+          }
+          snap('after configure');
+
+          // The three lines musickit.html runs with a saved token.
+          if ('{{.UserToken}}') music.musicUserToken = '{{.UserToken}}';
+          snap('after token (what musickit.html reports to Go)');
+
+          await sleep(3000);
+          snap('after 3s idle');
+
+          // What the first play does: an active-subscription check via me(),
+          // which fetches /me/account and sets storefrontCountryCode.
+          try {
+            await music.me();
+            snap('after me()');
+          } catch (e) { fail('me', e); snap('after me() (failed)'); }
+
+          // What authorize() does: /me/storefront.
+          try {
+            const sf = await music.storekit.requestStorefrontCountryCode();
+            snap('after requestStorefrontCountryCode()', { returned: sf });
+          } catch (e) { fail('requestStorefrontCountryCode', e); snap('after requestStorefrontCountryCode() (failed)'); }
+        } catch (e) {
+          fail('main', e);
+        }
+        flush();
+      });
+    </script>
+    <script src="https://js-cdn.music.apple.com/musickit/v3/musickit.js"
+            onerror="window.__fail && window.__fail('MusicKit.js failed to load from CDN')"></script>
+  </body>
+</html>
