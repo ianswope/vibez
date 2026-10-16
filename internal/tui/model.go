@@ -214,6 +214,13 @@ type feedTracksMsg struct {
 	playNext bool
 	err      error
 }
+
+type artistAlbumsMsg struct {
+	artist provider.Artist
+	albums []provider.Album
+	err    error
+}
+
 type searchCollectionTracksMsg struct {
 	label    string // album/playlist name for log messages
 	tracks   []provider.Track
@@ -981,6 +988,14 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.search.SetResults(msg.result, false, nil)
 		}
 
+	case artistAlbumsMsg:
+		if msg.err != nil {
+			m.appendLog(fmt.Sprintf("[search] artist %q albums error: %v", msg.artist.Name, msg.err))
+		} else {
+			m.appendLog(fmt.Sprintf("[search] artist %q: %d album(s)", msg.artist.Name, len(msg.albums)))
+		}
+		m.search.SetArtistAlbums(msg.artist.ID, msg.albums, msg.err)
+
 	case searchCollectionTracksMsg:
 		if msg.err != nil {
 			m.errMsg = fmt.Sprintf("search: %v", msg.err)
@@ -1211,11 +1226,19 @@ func (m *Model) handleKey(msg tea.KeyPressMsg) tea.Cmd {
 func (m *Model) handleSearchKey(k string, msg tea.KeyPressMsg) tea.Cmd {
 	switch k {
 	case "esc":
+		if m.search.InArtist() {
+			m.search.CloseArtist()
+			return nil
+		}
 		m.mode = modeNormal
 		m.searchQuery = ""
 		m.searchCursor = 0
 		return nil
 	case "enter":
+		// Artist: open their albums in place of the results.
+		if a := m.search.SelectedArtist(); a != nil {
+			return m.openArtistCmd(*a)
+		}
 		// Track: play now — replaces queue and starts immediately.
 		if t := m.search.SelectedTrack(); t != nil {
 			tc := *t
@@ -1690,6 +1713,19 @@ func (m *Model) fetchFeedCmd() tea.Cmd {
 		defer cancel()
 		groups, err := prov.GetRecommendations(ctx)
 		return feedResultMsg{groups: groups, err: err}
+	}
+}
+
+// openArtistCmd shows the artist in the search view and fetches their albums.
+func (m *Model) openArtistCmd(artist provider.Artist) tea.Cmd {
+	m.search.OpenArtist(artist)
+	m.appendLog(fmt.Sprintf("[search] loading artist %q (id=%s)…", artist.Name, artist.ID))
+	prov := m.provider
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+		albums, err := prov.GetArtistAlbums(ctx, artist.ID)
+		return artistAlbumsMsg{artist: artist, albums: albums, err: err}
 	}
 }
 
@@ -3564,11 +3600,19 @@ func (m *Model) searchLines(contentW, h int) []string {
 	} else if m.search.SelectedPlaylist() != nil {
 		kind = "playlist"
 	}
+	esc := " close"
+	if m.search.InArtist() {
+		esc = " back"
+	}
 	footer := "  " + accent.Render("Enter") + muted.Render(" play "+kind) +
 		"  ·  " + accent.Render("Tab") + muted.Render(" add to queue") +
 		"  ·  " + accent.Render("Shift+Tab") + muted.Render(" play next") +
 		"  ·  " + accent.Render("ctrl+p") + muted.Render(" add to playlist") +
-		"  ·  " + accent.Render("Esc") + muted.Render(" close")
+		"  ·  " + accent.Render("Esc") + muted.Render(esc)
+	if m.search.SelectedArtist() != nil {
+		footer = "  " + accent.Render("Enter") + muted.Render(" open artist") +
+			"  ·  " + accent.Render("Esc") + muted.Render(esc)
+	}
 
 	result := append([]string{inputLine, sep}, listLines...)
 	result = append(result, footerSep, footer)

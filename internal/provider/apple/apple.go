@@ -232,16 +232,24 @@ type songResource struct {
 }
 
 type albumAttributes struct {
-	Name       string       `json:"name"`
-	ArtistName string       `json:"artistName"`
-	Artwork    artworkAttrs `json:"artwork"`
-	TrackCount int          `json:"trackCount"`
-	PlayParams *playParams  `json:"playParams"`
+	Name        string       `json:"name"`
+	ArtistName  string       `json:"artistName"`
+	Artwork     artworkAttrs `json:"artwork"`
+	TrackCount  int          `json:"trackCount"`
+	ReleaseDate string       `json:"releaseDate"`
+	PlayParams  *playParams  `json:"playParams"`
 }
 
 type albumResource struct {
 	ID         string          `json:"id"`
 	Attributes albumAttributes `json:"attributes"`
+}
+
+type artistResource struct {
+	ID         string `json:"id"`
+	Attributes struct {
+		Name string `json:"name"`
+	} `json:"attributes"`
 }
 
 type playlistAttributes struct {
@@ -261,6 +269,11 @@ type paginatedSongs struct {
 	Meta struct {
 		Total int `json:"total"`
 	} `json:"meta"`
+}
+
+type paginatedAlbums struct {
+	Data []albumResource `json:"data"`
+	Next string          `json:"next"`
 }
 
 type paginatedPlaylists struct {
@@ -291,6 +304,9 @@ type searchResponse struct {
 		Albums struct {
 			Data []albumResource `json:"data"`
 		} `json:"albums"`
+		Artists struct {
+			Data []artistResource `json:"data"`
+		} `json:"artists"`
 		Playlists struct {
 			Data []playlistResource `json:"data"`
 		} `json:"playlists"`
@@ -345,11 +361,12 @@ func toTrack(s songResource) provider.Track {
 
 func toAlbum(r albumResource) provider.Album {
 	a := provider.Album{
-		ID:         r.ID,
-		Title:      provider.Clean(r.Attributes.Name),
-		Artist:     provider.Clean(r.Attributes.ArtistName),
-		ArtworkURL: r.Attributes.Artwork.formatted(300),
-		TrackCount: r.Attributes.TrackCount,
+		ID:          r.ID,
+		Title:       provider.Clean(r.Attributes.Name),
+		Artist:      provider.Clean(r.Attributes.ArtistName),
+		ArtworkURL:  r.Attributes.Artwork.formatted(300),
+		TrackCount:  r.Attributes.TrackCount,
+		ReleaseDate: r.Attributes.ReleaseDate,
 	}
 	if r.Attributes.PlayParams != nil && r.Attributes.PlayParams.CatalogID != "" {
 		a.CatalogID = r.Attributes.PlayParams.CatalogID
@@ -384,6 +401,7 @@ func (a *AppleProvider) Search(ctx context.Context, query string) (*provider.Sea
 	}
 	type catCollOut struct {
 		albums    []albumResource
+		artists   []artistResource
 		playlists []playlistResource
 		err       error
 	}
@@ -442,7 +460,7 @@ func (a *AppleProvider) Search(ctx context.Context, query string) (*provider.Sea
 		catSongsCh <- catSongsOut{songs: resp.Results.Songs.Data}
 	}()
 
-	// Catalog albums + playlists via the standard API.
+	// Catalog albums, artists and playlists via the standard API.
 	// amp-api.music.apple.com is a web-player endpoint that only reliably
 	// returns songs; albums and playlists must be fetched from the standard
 	// api.music.apple.com catalog endpoint.
@@ -452,7 +470,7 @@ func (a *AppleProvider) Search(ctx context.Context, query string) (*provider.Sea
 			catCollCh <- catCollOut{err: err}
 			return
 		}
-		ep := fmt.Sprintf("/catalog/%s/search?term=%s&types=albums,playlists&limit=10",
+		ep := fmt.Sprintf("/catalog/%s/search?term=%s&types=albums,artists,playlists&limit=10",
 			sf, url.QueryEscape(query))
 		req, err := a.newRequest(ctx, http.MethodGet, ep)
 		if err != nil {
@@ -466,6 +484,7 @@ func (a *AppleProvider) Search(ctx context.Context, query string) (*provider.Sea
 		}
 		catCollCh <- catCollOut{
 			albums:    resp.Results.Albums.Data,
+			artists:   resp.Results.Artists.Data,
 			playlists: resp.Results.Playlists.Data,
 		}
 	}()
@@ -490,7 +509,7 @@ func (a *AppleProvider) Search(ctx context.Context, query string) (*provider.Sea
 		result.Warnings = append(result.Warnings, fmt.Sprintf("catalog song search: %v", catSongs.err))
 	}
 	if catColl.err != nil {
-		result.Warnings = append(result.Warnings, fmt.Sprintf("catalog album/playlist search: %v", catColl.err))
+		result.Warnings = append(result.Warnings, fmt.Sprintf("catalog album/artist/playlist search: %v", catColl.err))
 	}
 
 	// Library songs first — guaranteed playable.
@@ -532,10 +551,17 @@ func (a *AppleProvider) Search(ctx context.Context, query string) (*provider.Sea
 		}
 	}
 
-	// Catalog albums + playlists — deduplicate against library playlists.
+	// Catalog albums, artists and playlists. Playlists are deduplicated
+	// against library playlists.
 	if catColl.err == nil {
 		for _, r := range catColl.albums {
 			result.Albums = append(result.Albums, toAlbum(r))
+		}
+		// The search limit applies to every type at once. An artist is a way
+		// into their albums rather than a result in itself, so a short list
+		// is enough.
+		for _, r := range catColl.artists[:min(len(catColl.artists), searchArtistLimit)] {
+			result.Artists = append(result.Artists, provider.Artist{ID: r.ID, Name: provider.Clean(r.Attributes.Name)})
 		}
 
 		seenPlaylists := make(map[string]bool, len(result.Playlists))
@@ -934,6 +960,39 @@ func (a *AppleProvider) GetAlbumTracks(ctx context.Context, albumID string) ([]p
 	}
 	endpoint := fmt.Sprintf("/catalog/%s/albums/%s/tracks?limit=100", sf, url.PathEscape(albumID))
 	return a.fetchSongsPaginated(ctx, endpoint, false)
+}
+
+// searchArtistLimit caps the artists a search returns.
+const searchArtistLimit = 5
+
+// GetArtistAlbums pages through the artist's catalog albums. Apple returns
+// them in no useful order, so they are sorted newest first here; that needs
+// every page, so a failed page fails the whole call rather than returning a
+// list that looks complete and isn't.
+func (a *AppleProvider) GetArtistAlbums(ctx context.Context, artistID string) ([]provider.Album, error) {
+	sf, err := a.storefront(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("GetArtistAlbums: %w", err)
+	}
+	var albums []provider.Album
+	endpoint := fmt.Sprintf("/catalog/%s/artists/%s/albums?limit=100", sf, url.PathEscape(artistID))
+	for endpoint != "" {
+		req, err := a.newRequest(ctx, http.MethodGet, endpoint)
+		if err != nil {
+			return nil, err
+		}
+		var page paginatedAlbums
+		if err := a.do(req, &page); err != nil {
+			return nil, fmt.Errorf("GetArtistAlbums: %w", err)
+		}
+		for _, r := range page.Data {
+			albums = append(albums, toAlbum(r))
+		}
+		endpoint = page.Next
+	}
+	// ISO dates sort as strings; a bare "YYYY" sorts before that year's dates.
+	slices.SortStableFunc(albums, func(x, y provider.Album) int { return strings.Compare(y.ReleaseDate, x.ReleaseDate) })
+	return albums, nil
 }
 
 func (a *AppleProvider) GetLibraryAlbumTracks(ctx context.Context, albumID string) ([]provider.Track, error) {

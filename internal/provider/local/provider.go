@@ -261,6 +261,11 @@ func (p *Provider) GetCatalogPlaylistTracks(_ context.Context, _ string) ([]prov
 	return nil, nil
 }
 
+// GetArtistAlbums returns nothing: local search returns no artists to open.
+func (p *Provider) GetArtistAlbums(_ context.Context, _ string) ([]provider.Album, error) {
+	return nil, nil
+}
+
 func (p *Provider) CreatePlaylist(_ context.Context, _ string, _ []string) (provider.Playlist, error) {
 	return provider.Playlist{}, nil
 }

@@ -117,6 +117,9 @@ func (m *mockProvider) GetLibraryAlbumTracks(_ context.Context, _ string) ([]pro
 func (m *mockProvider) GetCatalogPlaylistTracks(_ context.Context, _ string) ([]provider.Track, error) {
 	return nil, nil
 }
+func (m *mockProvider) GetArtistAlbums(_ context.Context, _ string) ([]provider.Album, error) {
+	return nil, nil
+}
 func (m *mockProvider) CreatePlaylist(_ context.Context, _ string, _ []string) (provider.Playlist, error) {
 	return provider.Playlist{}, nil
 }
@@ -689,6 +692,33 @@ func TestWaitForState_ReadsFromChannel(t *testing.T) {
 	}
 	if ps.Volume != 0.9 {
 		t.Errorf("playerStateMsg.Volume = %v, want 0.9", ps.Volume)
+	}
+}
+
+// --- Search: Enter opens an artist, Esc steps back out (#164) ---
+
+func TestModel_SearchArtistEnterOpensEscReturns(t *testing.T) {
+	m := newModel(nil)
+	m.mode = modeSearch
+	m.search.SetResults(&provider.SearchResult{Artists: []provider.Artist{{ID: "ar1", Name: "Some Artist"}}}, false, nil)
+
+	cmd := m.handleSearchKey("enter", tea.KeyPressMsg{Code: tea.KeyEnter})
+	if cmd == nil || !m.search.InArtist() {
+		t.Fatal("Enter on an artist should open it and fetch its albums")
+	}
+	msg, ok := cmd().(artistAlbumsMsg)
+	if !ok || msg.artist.ID != "ar1" {
+		t.Fatalf("fetch returned %#v, want artistAlbumsMsg for ar1", msg)
+	}
+	m.Update(msg)
+
+	m.handleSearchKey("esc", tea.KeyPressMsg{Code: tea.KeyEscape})
+	if m.search.InArtist() || m.mode != modeSearch {
+		t.Fatalf("first Esc should go back to the results and stay in search (mode %d)", m.mode)
+	}
+	m.handleSearchKey("esc", tea.KeyPressMsg{Code: tea.KeyEscape})
+	if m.mode != modeNormal {
+		t.Errorf("second Esc should close search (mode %d)", m.mode)
 	}
 }
 
