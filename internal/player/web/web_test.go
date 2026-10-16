@@ -116,3 +116,20 @@ func TestRenderHTMLConfiguresStorefrontOnlyWhenGiven(t *testing.T) {
 		t.Error("rendered HTML configures a storefront when none was given")
 	}
 }
+
+// A storefront from a hand-edited config.json is interpolated into JS string
+// literals, so anything that isn't a storefront ID must not reach the page.
+func TestRenderHTMLDropsMalformedStorefront(t *testing.T) {
+	for _, sf := range []string{"us'; alert(1); '", "us`", "us\\", "u s"} {
+		html, err := RenderHTML("dev", "", sf, "test", 256)
+		if err != nil {
+			t.Fatalf("RenderHTML(%q): %v", sf, err)
+		}
+		if strings.Contains(html, "configOpts.storefrontId =") {
+			t.Errorf("RenderHTML(%q) configured MusicKit with a malformed storefront", sf)
+		}
+		if strings.Contains(html, sf) {
+			t.Errorf("RenderHTML(%q) rendered the malformed storefront into the page", sf)
+		}
+	}
+}
