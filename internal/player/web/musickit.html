@@ -976,6 +976,7 @@
             for (const item of items) _removedIds.delete(item.id); // re-added: play it
             if (_qi < 0) { _q = _q.concat(items); _playAt(0); return; } // nothing playing
             const insert = _nativeQueue ? await _catalogForNative(items) : items;
+            if (_qi < 0) { _q = _q.concat(items); _playAt(0); return; } // stopped during the lookup
             _q.splice(_qi + 1, 0, ...insert);
             _log(`[js:playNext] +${insert.length} at #${_qi + 1} → _q.length=${_q.length}`);
             if (!_nativeQueue) return; // one-item mode advances through _q itself
@@ -1004,7 +1005,7 @@
           const byId = {};
           try {
             const sf = _m().storefrontId || 'us';
-            const r  = await _m().api.music(`/v1/catalog/${sf}/songs`, { ids });
+            const r  = await _m().api.music(`/v1/catalog/${encodeURIComponent(sf)}/songs`, { ids });
             for (const s of r?.data?.data ?? []) {
               const pp = s.attributes?.playParams;
               if (pp && pp.id && pp.kind === 'song') byId[s.id] = s;

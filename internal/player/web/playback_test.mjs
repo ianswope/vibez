@@ -68,12 +68,13 @@ const libSongs = {
  'i.U1': { id: 'i.U1', attributes: { playParams: { id: 'i.U1', kind: 'song' } } }, // upload, no catalog copy
 };
 const catalogSong = id => ({ id, attributes: { playParams: { id, kind: 'song' } } });
-function setupPlayNext({ native, mirrors = true, qi = 1, playNextFails = false, catalog = {}, lookupFails = false } = {}) {
+function setupPlayNext({ native, mirrors = true, qi = 1, playNextFails = false, catalog = {}, lookupFails = false, onLookup = () => {} } = {}) {
  const calls = [];
  const m = {
   storefrontId: 'us',
   api: { async music(path, { ids }) {
    calls.push(['lookup', ids.join(',')]);
+   onLookup(env);
    if (lookupFails) throw new Error('offline');
    return { data: { data: ids.filter(id => catalog[id]).map(id => catalog[id]) } };
   } },
@@ -139,6 +140,13 @@ test('playNext keeps library items when the catalog lookup fails', async () => {
  await env.window.vibezQueuePlayNext('["i.L1"]');
  assert.equal(ids(), 'a,b,i.L1,c');
  assert.deepEqual(calls.map(c => c.join(':')), ['lookup:901', 'playNext:i.L1']);
+});
+test('playNext appends and starts when playback stops during the catalog lookup', async () => {
+ const { env, calls, ids } = setupPlayNext({ native: true, catalog: { '901': catalogSong('901') },
+  onLookup: env => { env._q = []; env._qi = -1; } });
+ await env.window.vibezQueuePlayNext('["i.L1"]');
+ assert.equal(ids(), 'i.L1');
+ assert.deepEqual(calls.map(c => c.join(':')), ['lookup:901', 'playAt:0'], 'no playNext on a stopped queue');
 });
 test('playNext in one-item mode does not swap library items', async () => {
  const { env, calls, ids } = setupPlayNext({ native: false, catalog: { '901': catalogSong('901') } });
