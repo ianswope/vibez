@@ -366,7 +366,7 @@ func toAlbum(r albumResource) provider.Album {
 		Artist:      provider.Clean(r.Attributes.ArtistName),
 		ArtworkURL:  r.Attributes.Artwork.formatted(300),
 		TrackCount:  r.Attributes.TrackCount,
-		ReleaseDate: r.Attributes.ReleaseDate,
+		ReleaseDate: provider.Clean(r.Attributes.ReleaseDate),
 	}
 	if r.Attributes.PlayParams != nil && r.Attributes.PlayParams.CatalogID != "" {
 		a.CatalogID = r.Attributes.PlayParams.CatalogID
@@ -965,6 +965,10 @@ func (a *AppleProvider) GetAlbumTracks(ctx context.Context, albumID string) ([]p
 // searchArtistLimit caps the artists a search returns.
 const searchArtistLimit = 5
 
+// maxArtistAlbumPages bounds GetArtistAlbums at 2,000 albums, far past any
+// real discography, so a "next" link that never ends can't loop forever.
+const maxArtistAlbumPages = 20
+
 // GetArtistAlbums pages through the artist's catalog albums. Apple returns
 // them in no useful order, so they are sorted newest first here; that needs
 // every page, so a failed page fails the whole call rather than returning a
@@ -976,7 +980,10 @@ func (a *AppleProvider) GetArtistAlbums(ctx context.Context, artistID string) ([
 	}
 	var albums []provider.Album
 	endpoint := fmt.Sprintf("/catalog/%s/artists/%s/albums?limit=100", sf, url.PathEscape(artistID))
-	for endpoint != "" {
+	for pages := 0; endpoint != ""; pages++ {
+		if pages == maxArtistAlbumPages {
+			return nil, fmt.Errorf("GetArtistAlbums: more than %d pages", maxArtistAlbumPages)
+		}
 		req, err := a.newRequest(ctx, http.MethodGet, endpoint)
 		if err != nil {
 			return nil, err

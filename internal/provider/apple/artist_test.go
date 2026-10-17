@@ -103,3 +103,22 @@ func TestGetArtistAlbums_FailedPageFailsTheCall(t *testing.T) {
 		t.Fatalf("GetArtistAlbums = %d album(s), nil error; want an error, not a list that looks complete", len(albums))
 	}
 }
+
+func TestGetArtistAlbums_EndlessNextIsBounded(t *testing.T) {
+	requests := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		writeJSON(t, w, map[string]any{
+			"data": []any{datedAlbumJSON("a", "A", "2020-01-01")},
+			"next": "/v1/catalog/us/artists/42/albums?offset=1",
+		})
+	}))
+	defer srv.Close()
+
+	if _, err := newTestProvider(t, srv).GetArtistAlbums(context.Background(), "42"); err == nil {
+		t.Fatal("GetArtistAlbums = nil error; want an error once the page cap is hit")
+	}
+	if requests != 20 {
+		t.Errorf("requests = %d, want 20 (the page cap)", requests)
+	}
+}
