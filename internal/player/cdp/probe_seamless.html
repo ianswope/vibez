@@ -40,6 +40,13 @@
       // Instrumentation, installed before musickit.js so every SourceBuffer
       // and key session MusicKit creates goes through it. Records, never
       // alters, unless SHIFT_MS is set (see below).
+      // MusicKit's own dev flags, read from localStorage when musickit.js
+      // loads. HLSJS=1 routes songs through HlsJsAudioPlayer with hls.js's
+      // gapless option and item preloading on, instead of the MSE AudioPlayer.
+      try {
+        for (const k of ['mk-hlsjs-song-playback', 'mk-hlsjs-interstitial-playback', 'mk-hlsjs-item-preloading'])
+          {{if .HlsJs}}localStorage.setItem(k, '1'){{else}}localStorage.removeItem(k){{end}};
+      } catch (_) {}
       window.__ev = [];
       const __log = (kind, o) => window.__ev.push(Object.assign({ wall: Date.now(), kind }, o || {}));
       const __ranges = (tr) => { const r = []; for (let i = 0; i < tr.length; i++) r.push([+tr.start(i).toFixed(4), +tr.end(i).toFixed(4)]); return r; };
@@ -89,6 +96,13 @@
       SourceBuffer.prototype.appendBuffer = function (data) {
         const sb = this;
         const info = __boxes(data);
+        // Init segments are ~1 KB; keep them whole to look for gapless
+        // metadata (iTunSMPB, elst, sgpd roll) offline.
+        if (data.byteLength < 4096) {
+          const u = data instanceof ArrayBuffer ? new Uint8Array(data) : new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+          let bin = ''; for (const c of u) bin += String.fromCharCode(c);
+          info.b64 = btoa(bin);
+        }
         __log('append', Object.assign({ bytes: data.byteLength, tsOffset: tsDesc.get.call(sb), before: __ranges(sb.buffered) }, info));
         sb.addEventListener('updateend', () => __log('appended', { after: __ranges(sb.buffered) }), { once: true });
         return origAppend.call(this, data);
@@ -129,6 +143,8 @@
           const m = () => MusicKit.getInstance();
           if ('{{.UserToken}}') m().musicUserToken = '{{.UserToken}}';
           RESULT.musickitVersion = MusicKit.version || null;
+          for (const ev of ['mediaPlaybackError', 'playbackError'])
+            m().addEventListener(ev, (e) => window.__ev.push({ wall: Date.now(), kind: 'mk:' + ev, error: errStr(e?.detail ?? e) }));
 
           const sf = m().storefrontId || '{{.Storefront}}' || 'us';
           const ALBUM = '{{.Album}}';
