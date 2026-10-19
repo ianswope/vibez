@@ -207,7 +207,11 @@
                 this.cap = 1 << 16;
                 this.buf = [new Float32Array(this.cap), new Float32Array(this.cap)];
                 this.w = 0; this.r = 0;            // absolute write / read positions
-                this.target = Math.round(0.1 * sampleRate);
+                // 250 ms: the element delivers in bursts around a join (the
+                // decoder resets for the next song's init segment), and after
+                // a 90 ms cut the remainder must still cover a late burst.
+                this.target = Math.round(0.25 * sampleRate);
+                this.minLevel = Infinity;
                 this.maxDrop = Math.round(0.09 * sampleRate);
                 // Fragments count: the join's silence comes out of the decoder
                 // as runs of near-zero samples broken by single tiny values.
@@ -251,7 +255,17 @@
                     if (this.w - this.r >= this.target) this.started = true;
                     else { for (const ch of out) ch[i] = 0; continue; }
                   }
-                  if (this.w - this.r < 2) { this.started = false; for (const ch of out) ch[i] = 0; continue; }
+                  if (this.w - this.r < 2) {
+                    this.started = false;
+                    this.port.postMessage({ underrun: true, frame: this.frame });
+                    for (const ch of out) ch[i] = 0;
+                    continue;
+                  }
+                  if (this.w - this.r < this.minLevel) this.minLevel = this.w - this.r;
+                  if ((this.frame & 0xffff) === 0) {
+                    this.port.postMessage({ minLevelMs: this.minLevel / sampleRate * 1000, frame: this.frame });
+                    this.minLevel = Infinity;
+                  }
                   const ri = Math.floor(this.r), f = this.r - ri;
                   const k0 = ri & (this.cap - 1), k1 = (ri + 1) & (this.cap - 1);
                   for (let c = 0; c < out.length; c++) {
