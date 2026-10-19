@@ -174,6 +174,7 @@
               item: m().nowPlayingItem?.id ?? null,
               seamless: a ? !!a.isSeamlessAudioTransitionsEnabled : null,
               nextManifest: a?.nextManifest?.mediaItem?.id ?? null,
+              nextPrepared: m().queue?.nextPlayableItem?.isPreparedToPlay ?? null,
               hasBuffer: !!b,
               transitionAt: b?.nextSeamlessTransition ?? null,
               timelineNext: b?.playbackTimeline?.next?.manifest?.mediaItem?.id ?? null,
@@ -190,6 +191,107 @@
           });
           const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
+
+          // ── Gap squasher (SQUASH=1) ──────────────────────────────────────
+          // MusicKit's seamless join leaves ~50 ms of exact digital zeros
+          // that are not in the stream: priming is only part of it, and the
+          // rest appears when Chrome reconfigures the decoder for the next
+          // song's init segment. Remove it at the output instead: run the
+          // element through a worklet that holds ~100 ms of lookahead, cut a
+          // run of exact zeros (<= 90 ms) while armed around a scheduled join,
+          // and win the lookahead back by reading 0.2% slow afterwards.
+          const SQUASH_SRC = `
+            class GapSquash extends AudioWorkletProcessor {
+              constructor() {
+                super();
+                this.cap = 1 << 16;
+                this.buf = [new Float32Array(this.cap), new Float32Array(this.cap)];
+                this.w = 0; this.r = 0;            // absolute write / read positions
+                this.target = Math.round(0.1 * sampleRate);
+                this.maxDrop = Math.round(0.09 * sampleRate);
+                // Fragments count: the join's silence comes out of the decoder
+                // as runs of near-zero samples broken by single tiny values.
+                this.minRun = Math.round(0.001 * sampleRate);
+                // One 16-bit LSB. The decoder's output across the join is
+                // tiny rather than exactly zero, and rounds to 0 on output.
+                this.thr = 1 / 32768;
+                this.cutInWindow = 0;
+                this.started = false; this.armed = false;
+                this.zrun = 0; this.deficit = 0; this.eps = 0.002;
+                this.frame = 0;
+                this.port.onmessage = (e) => {
+                  if (e.data === 'arm') { this.armed = true; this.cutInWindow = 0; }
+                  else if (e.data === 'disarm') this.armed = false;
+                  else if (e.data === 'flush') { this.w = 0; this.r = 0; this.started = false; this.zrun = 0; this.deficit = 0; }
+                };
+              }
+              endRun() {
+                const z = this.zrun; this.zrun = 0;
+                if (z < this.minRun) return;
+                const unread = this.w - Math.ceil(this.r);
+                const cut = this.armed && this.cutInWindow + z <= this.maxDrop && z <= unread - 2;
+                this.port.postMessage({ run: z / sampleRate * 1000, armed: this.armed, cut, frame: this.frame,
+                                        level: (this.w - this.r) / sampleRate * 1000 });
+                if (cut) { this.w -= z; this.deficit += z; this.cutInWindow += z; }
+              }
+              process(inputs, outputs) {
+                const inp = inputs[0], out = outputs[0];
+                const n = out[0].length;
+                const a = inp[0], b = inp[1] || inp[0];
+                if (a) for (let i = 0; i < a.length; i++) {
+                  const x0 = a[i], x1 = b[i];
+                  const zero = Math.abs(x0) < this.thr && Math.abs(x1) < this.thr;
+                  if (!zero && this.zrun) this.endRun();
+                  const k = this.w & (this.cap - 1);
+                  this.buf[0][k] = x0; this.buf[1][k] = x1; this.w++;
+                  if (zero) this.zrun++;
+                }
+                for (let i = 0; i < n; i++, this.frame++) {
+                  if (!this.started) {
+                    if (this.w - this.r >= this.target) this.started = true;
+                    else { for (const ch of out) ch[i] = 0; continue; }
+                  }
+                  if (this.w - this.r < 2) { this.started = false; for (const ch of out) ch[i] = 0; continue; }
+                  const ri = Math.floor(this.r), f = this.r - ri;
+                  const k0 = ri & (this.cap - 1), k1 = (ri + 1) & (this.cap - 1);
+                  for (let c = 0; c < out.length; c++) {
+                    const src = this.buf[Math.min(c, 1)];
+                    out[c][i] = src[k0] + (src[k1] - src[k0]) * f;
+                  }
+                  if (this.deficit > 0) { this.r += 1 - this.eps; this.deficit -= this.eps; }
+                  else this.r += 1;
+                }
+                return true;
+              }
+            }
+            registerProcessor('gap-squash', GapSquash);`;
+          let squashCtx = null, squashNode = null;
+          const setupSquash = async () => {
+            const el = document.querySelector('audio');
+            if (!el) { fail('squash', 'no audio element'); return; }
+            squashCtx = new AudioContext();
+            await squashCtx.audioWorklet.addModule(URL.createObjectURL(new Blob([SQUASH_SRC], { type: 'text/javascript' })));
+            const src = squashCtx.createMediaElementSource(el);
+            squashNode = new AudioWorkletNode(squashCtx, 'gap-squash', { outputChannelCount: [2] });
+            squashNode.port.onmessage = (e) => window.__ev.push(Object.assign({ wall: Date.now(), kind: 'squash' }, e.data));
+            src.connect(squashNode).connect(squashCtx.destination);
+            if (squashCtx.state === 'suspended') await squashCtx.resume();
+            RESULT.squashRate = squashCtx.sampleRate;
+            el.addEventListener('seeking', () => squashNode.port.postMessage('flush'));
+            // Armed while the element is within 1.5 s of a scheduled join, and
+            // for 1.5 s after, since MusicKit clears the schedule at the item
+            // change, a few hundred ms after the audible join.
+            let lastNear = 0, armed = false;
+            setInterval(() => {
+              const b = window.audioPlayer?._buffer;
+              const t = b?.nextSeamlessTransition;
+              const now = Date.now();
+              if (typeof t === 'number' && Math.abs(el.currentTime - t) < 1.5) lastNear = now;
+              const want = now - lastNear < 1500;
+              if (want !== armed) { armed = want; squashNode.port.postMessage(want ? 'arm' : 'disarm'); window.__ev.push({ wall: now, kind: want ? 'arm' : 'disarm', ct: el.currentTime }); }
+            }, 50);
+          };
+
           // The shape vibez ships (_doPlayNativeAt).
           // vibez does setQueue then changeToMediaAtIndex; startWith picks the
           // start item inside setQueue instead. #96 round 2 asks whether the
@@ -205,6 +307,28 @@
           try { await m().play(); } catch (e) { await m().stop().catch(() => {}); await m().play(); }
           if (!await waitFor(() => m().playbackState === 2, 25000)) { fail('start', 'never reached playing'); flush(); return; }
           RESULT.playStartWall = Date.now();
+          if ({{.Squash}}) await setupSquash().catch(e => fail('squash', e));
+          // MusicKit race: setQueue's onQueueChange runs prepareToPlayNextItem
+          // before the AudioPlayer has a buffer, which marks the next item
+          // isPreparedToPlay while preloadItem bails for want of a buffer. The
+          // 30% Preloader then skips it as already prepared, so the first join
+          // is never seamless. KICK=1 queues the next manifest directly once a
+          // buffer exists and nothing is queued.
+          if ({{.Kick}}) setInterval(() => {
+            // Late rescue only: past 35% the Preloader (30%) should already
+            // have queued it. Never near a join: MusicKit's nextManifest is
+            // briefly empty while it hands over, and a setNextManifest then
+            // abandons the transition in flight and stalls playback.
+            const ap = window.audioPlayer, next = m().queue?.nextPlayableItem;
+            if (!ap?._buffer || ap.nextManifest || !next || next.type !== 'song' || m().playbackState !== 2) return;
+            if (ap._buffer.nextSeamlessTransition != null) return;
+            const dur = m().currentPlaybackDuration, t = m().currentPlaybackTime;
+            if (!(dur > 0) || t < dur * 0.35 || dur - t < 10) return;
+            if (ap.__kicking === next.id) return;
+            ap.__kicking = next.id;
+            window.__ev.push({ wall: Date.now(), kind: 'kick', next: next.id, prepared: !!next.isPreparedToPlay });
+            ap.preloadItem(next).catch(e => window.__ev.push({ wall: Date.now(), kind: 'kick-failed', error: errStr(e) }));
+          }, 500);
 
           for (let k = 0; k < COUNT; k++) {
             const idx = START + k;

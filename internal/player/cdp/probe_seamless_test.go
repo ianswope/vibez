@@ -118,6 +118,8 @@ func TestProbeSeamless(t *testing.T) {
 		"StartMode":      startMode,
 		"ShiftMs":        shiftMs,
 		"HlsJs":          os.Getenv("VIBEZ_PROBE_HLSJS") == "1",
+		"Squash":         os.Getenv("VIBEZ_PROBE_SQUASH") == "1",
+		"Kick":           os.Getenv("VIBEZ_PROBE_KICK") == "1",
 	}); err != nil {
 		t.Fatalf("render probe: %v", err)
 	}
