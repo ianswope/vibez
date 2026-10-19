@@ -1,0 +1,175 @@
+<!DOCTYPE html>
+<!--
+  PROTOTYPE INSTRUMENT — issue #96 (seamless transitions). Not shipped.
+
+  The earlier probes treated MusicKit as a black box and polled the media
+  element's currentTime. Reading the CDN build (3.2526.0) shows it is not one:
+
+    - AudioPlayer, the player every catalog song gets on Chrome, has a seamless
+      mode. With it on, MseBuffer.setNextManifest queues the next song and,
+      once the current one is fully buffered, transitionToNextManifest appends
+      it to the SAME SourceBuffer at the end of the current one's timeline. No
+      src swap, so nothing to decode from cold at the boundary.
+    - It is gated on bag.features["seamless-audio-transitions"], which defaults
+      to TRUE in the built-in bag, and configure({features:[...]}) can switch it
+      off with a "-" prefix. That is the control arm here.
+    - The next song is prepared by a Preloader that fires once playback passes
+      30% of the current item (PercentageWatcher .3), calling
+      prepareToPlayNextItem -> AudioPlayer.preloadItem -> setNextManifest.
+    - The player instance is published as window.audioPlayer.
+
+  So the one-src/two-src split in the repeat probe is most likely seamless mode
+  engaging or not, and this instrument reads that state directly instead of
+  inferring it: whether seamless is enabled, which manifest is queued next, and
+  where the transition was scheduled, sampled every 50 ms alongside the media
+  element. The Go side records the actual audio output, which is the only
+  ground truth for "is there a gap": a 50 ms poll cannot tell a seamless join
+  from a 50 ms hole.
+
+  The queue is the shape vibez ships: setQueue({items:[whole album]}), then
+  changeToMediaAtIndex(start), as _doPlayNativeAt does.
+-->
+<html>
+  <head><meta charset="utf-8"><title>vibez seamless probe</title></head>
+  <body>
+    <script>
+      window.addEventListener('error',   (e) => window.__fail?.(e.message || 'window error'));
+      window.addEventListener('unhandledrejection', (e) => window.__fail?.(String(e.reason)));
+    </script>
+    <script>
+      document.addEventListener('musickitloaded', async function () {
+        const RESULT = { musickitVersion: null, features: {{.FeaturesJSON}}, boundaries: [], errors: [] };
+        const errStr = (e) => (e && (e.name ? e.name + (e.message ? ': ' + e.message : '') : e.message)) || String(e);
+        const fail = (stage, e) => { RESULT.errors.push({ stage, error: errStr(e) }); };
+        window.__fail = (msg) => { fail('window', msg); flush(); };
+        let flushed = false;
+        const flush = () => {
+          if (flushed) return;
+          flushed = true;
+          goProbeResult(JSON.stringify(RESULT)).catch(() => {});
+        };
+
+        try {
+          const opts = {
+            developerToken: '{{.DeveloperToken}}',
+            app: { name: 'vibez-probe', build: 'probe' },
+          };
+          if (RESULT.features.length) opts.features = RESULT.features;
+          await MusicKit.configure(opts);
+          const m = () => MusicKit.getInstance();
+          if ('{{.UserToken}}') m().musicUserToken = '{{.UserToken}}';
+          RESULT.musickitVersion = MusicKit.version || null;
+
+          const sf = m().storefrontId || '{{.Storefront}}' || 'us';
+          const ALBUM = '{{.Album}}';
+          const START = {{.Start}};
+          const COUNT = {{.Count}};
+          const NATURAL = {{.Natural}};
+          const LEAD_S = {{.LeadSeconds}};
+          const TAIL_MS = {{.TailMs}};
+
+          let tracks = [];
+          try {
+            const r = await m().api.music(`/v1/catalog/${sf}/albums/${ALBUM}/tracks`, { limit: 100 });
+            tracks = (r?.data?.data ?? []).filter(t => t.type === 'songs');
+          } catch (e) { fail('resolve-album', e); flush(); return; }
+          if (tracks.length < START + 2) { fail('resolve-album', `album has ${tracks.length} songs`); flush(); return; }
+          RESULT.tracks = tracks.map((t, i) => ({ i, id: t.id, name: t.attributes?.name,
+            durMs: t.attributes?.durationInMillis }));
+
+          const ap = () => window.audioPlayer;
+          const buf = () => ap()?._buffer;
+          const media = () => Array.from(document.querySelectorAll('audio,video'));
+          const snap = (kind) => {
+            const a = ap(), b = buf(), el = media();
+            return {
+              wall: Date.now(), kind,
+              state: m().playbackState,
+              item: m().nowPlayingItem?.id ?? null,
+              seamless: a ? !!a.isSeamlessAudioTransitionsEnabled : null,
+              nextManifest: a?.nextManifest?.mediaItem?.id ?? null,
+              hasBuffer: !!b,
+              transitionAt: b?.nextSeamlessTransition ?? null,
+              timelineNext: b?.playbackTimeline?.next?.manifest?.mediaItem?.id ?? null,
+              timelineCurrent: b?.playbackTimeline?.current?.manifest?.mediaItem?.id ?? null,
+              media: el.map((x, i) => ({ i, ct: +(x.currentTime || 0).toFixed(3), paused: !!x.paused,
+                rs: x.readyState, src: (x.currentSrc || '').slice(-24) || null,
+                bufEnd: x.buffered.length ? +x.buffered.end(x.buffered.length - 1).toFixed(3) : null })),
+            };
+          };
+
+          const waitFor = (pred, ms) => new Promise(res => {
+            const iv = setInterval(() => { if (pred()) { clearInterval(iv); clearTimeout(to); res(true); } }, 40);
+            const to = setTimeout(() => { clearInterval(iv); res(false); }, ms);
+          });
+          const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+          // The shape vibez ships (_doPlayNativeAt).
+          await m().setQueue({ items: tracks });
+          if (START > 0) await m().changeToMediaAtIndex(START);
+          try { await m().play(); } catch (e) { await m().stop().catch(() => {}); await m().play(); }
+          if (!await waitFor(() => m().playbackState === 2, 25000)) { fail('start', 'never reached playing'); flush(); return; }
+          RESULT.playStartWall = Date.now();
+
+          for (let k = 0; k < COUNT; k++) {
+            const idx = START + k;
+            const fromId = tracks[idx].id, toId = tracks[idx + 1]?.id;
+            if (!toId) break;
+            if (!await waitFor(() => m().nowPlayingItem?.id === fromId && m().playbackState === 2, 25000)) {
+              RESULT.boundaries.push({ k, fromId, toId, error: 'from-track never playing' });
+              break;
+            }
+            const timeline = [];
+            const poll = setInterval(() => timeline.push(snap('poll')), 50);
+            const onItem  = () => timeline.push(snap('item'));
+            const onState = () => timeline.push(snap('state'));
+            m().addEventListener('nowPlayingItemDidChange', onItem);
+            m().addEventListener('playbackStateDidChange', onState);
+
+            const durS = (tracks[idx].attributes?.durationInMillis ?? 0) / 1000;
+            // Natural mode never seeks: the boundary arrives the way it does in
+            // real listening. Seek mode crosses the Preloader's 30% threshold
+            // first and gives it time to queue the next manifest, then jumps
+            // to LEAD_S before the end, so a long track costs seconds.
+            const natural = NATURAL || k === 0 && durS < 90;
+            if (!natural && durS > LEAD_S + 10) {
+              await m().seekToTime(durS * 0.35).catch(e => fail('seek35', e));
+              await sleep(5000);
+              timeline.push(snap('before-seek-end'));
+              await m().seekToTime(Math.max(0, durS - LEAD_S)).catch(e => fail('seekEnd', e));
+            }
+            const crossed = await waitFor(() => m().nowPlayingItem?.id === toId, (natural ? durS + 30 : LEAD_S + 30) * 1000);
+            const crossWall = Date.now();
+            await sleep(TAIL_MS);
+            clearInterval(poll);
+            m().removeEventListener('nowPlayingItemDidChange', onItem);
+            m().removeEventListener('playbackStateDidChange', onState);
+
+            const srcs = new Set();
+            for (const e of timeline) for (const x of e.media) if (x.src) srcs.add(x.src);
+            // The last stamp before the item changed says what MusicKit had
+            // lined up when it got there.
+            const before = timeline.filter(e => e.item === fromId).pop() ?? null;
+            RESULT.boundaries.push({
+              k, fromIdx: idx, fromId, toId, natural, crossed, crossWall,
+              distinctMediaSrcs: srcs.size,
+              mediaElements: Math.max(0, ...timeline.map(e => e.media.length)),
+              seamlessEnabled: before?.seamless ?? null,
+              nextManifestBefore: before?.nextManifest ?? null,
+              transitionScheduled: timeline.some(e => e.transitionAt != null),
+              timeline,
+            });
+            if (!crossed) break;
+          }
+
+          await m().stop().catch(() => {});
+          flush();
+        } catch (e) {
+          fail('top', e);
+          flush();
+        }
+      });
+    </script>
+    <script src="https://js-cdn.music.apple.com/musickit/v3/musickit.js" data-web-components async></script>
+  </body>
+</html>
