@@ -37,6 +37,76 @@
       window.addEventListener('unhandledrejection', (e) => window.__fail?.(String(e.reason)));
     </script>
     <script>
+      // Instrumentation, installed before musickit.js so every SourceBuffer
+      // and key session MusicKit creates goes through it. Records, never
+      // alters, unless SHIFT_MS is set (see below).
+      window.__ev = [];
+      const __log = (kind, o) => window.__ev.push(Object.assign({ wall: Date.now(), kind }, o || {}));
+      const __ranges = (tr) => { const r = []; for (let i = 0; i < tr.length; i++) r.push([+tr.start(i).toFixed(4), +tr.end(i).toFixed(4)]); return r; };
+      // First tfdt baseMediaDecodeTime in an fMP4 chunk, and mdhd timescale
+      // when the chunk carries an init segment. Enough to see where a song's
+      // first sample is stamped relative to zero.
+      const __u32 = (b, o) => (b[o] << 24 | b[o+1] << 16 | b[o+2] << 8 | b[o+3]) >>> 0;
+      const __find = (b, tag) => { for (let i = 4; i + 4 <= b.length; i++) if (b[i]===tag.charCodeAt(0)&&b[i+1]===tag.charCodeAt(1)&&b[i+2]===tag.charCodeAt(2)&&b[i+3]===tag.charCodeAt(3)) return i; return -1; };
+      const __boxes = (buf) => {
+        const b = buf instanceof ArrayBuffer ? new Uint8Array(buf) : new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength);
+        const out = {};
+        const t = __find(b, 'tfdt');
+        if (t >= 0) { const v = b[t+4]; out.tfdt = v === 1 ? __u32(b, t+8) * 4294967296 + __u32(b, t+12) : __u32(b, t+8); }
+        const m = __find(b, 'mdhd');
+        if (m >= 0) { const v = b[m+4]; out.timescale = v === 1 ? __u32(b, m+24) : __u32(b, m+16); }
+        const e = __find(b, 'elst');
+        if (e >= 0) { const v = b[e+4]; out.elstMediaTime = v === 1 ? __u32(b, e+20) * 4294967296 + __u32(b, e+24) : __u32(b, e+16); }
+        return out;
+      };
+      const SHIFT_S = {{.ShiftMs}} / 1000;
+      const tsDesc = Object.getOwnPropertyDescriptor(SourceBuffer.prototype, 'timestampOffset');
+      const awDesc = Object.getOwnPropertyDescriptor(SourceBuffer.prototype, 'appendWindowStart');
+      Object.defineProperty(SourceBuffer.prototype, 'timestampOffset', {
+        configurable: true,
+        get() { return tsDesc.get.call(this); },
+        set(v) {
+          // MusicKit sets a non-zero offset only to start the next song at the
+          // end of the current one. SHIFT_S pulls that start earlier, and
+          // appendWindowStart at the join makes the browser drop the shifted
+          // song's leading samples (the encoder priming) rather than overwrite
+          // the tail of the current one. Any other offset resets the window,
+          // or a revert that re-appends the current song would be cut.
+          let applied = v;
+          if (SHIFT_S > 0) {
+            if (v > 0) {
+              applied = v - SHIFT_S;
+              awDesc.set.call(this, v);
+            } else {
+              awDesc.set.call(this, 0);
+            }
+          }
+          __log('tsOffset', { requested: v, applied, appendWindowStart: awDesc.get.call(this) });
+          tsDesc.set.call(this, applied);
+        },
+      });
+      const origAppend = SourceBuffer.prototype.appendBuffer;
+      SourceBuffer.prototype.appendBuffer = function (data) {
+        const sb = this;
+        const info = __boxes(data);
+        __log('append', Object.assign({ bytes: data.byteLength, tsOffset: tsDesc.get.call(sb), before: __ranges(sb.buffered) }, info));
+        sb.addEventListener('updateend', () => __log('appended', { after: __ranges(sb.buffered) }), { once: true });
+        return origAppend.call(this, data);
+      };
+      const origUpdate = MediaKeySession.prototype.update;
+      MediaKeySession.prototype.update = function (resp) {
+        __log('keyUpdate', { session: this.sessionId });
+        return origUpdate.call(this, resp).then(r => { __log('keyUpdated', { session: this.sessionId }); return r; });
+      };
+      const origGen = MediaKeySession.prototype.generateRequest;
+      MediaKeySession.prototype.generateRequest = function (...a) {
+        __log('keyRequest', {});
+        return origGen.apply(this, a);
+      };
+      for (const t of ['waiting', 'stalled', 'playing', 'seeking', 'seeked', 'emptied', 'loadstart', 'encrypted'])
+        document.addEventListener(t, (e) => { if (e.target instanceof HTMLMediaElement) __log('el:' + t, { ct: +e.target.currentTime.toFixed(3) }); }, true);
+    </script>
+    <script>
       document.addEventListener('musickitloaded', async function () {
         const RESULT = { musickitVersion: null, features: {{.FeaturesJSON}}, boundaries: [], errors: [] };
         const errStr = (e) => (e && (e.name ? e.name + (e.message ? ': ' + e.message : '') : e.message)) || String(e);
@@ -105,8 +175,17 @@
           const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
           // The shape vibez ships (_doPlayNativeAt).
-          await m().setQueue({ items: tracks });
-          if (START > 0) await m().changeToMediaAtIndex(START);
+          // vibez does setQueue then changeToMediaAtIndex; startWith picks the
+          // start item inside setQueue instead. #96 round 2 asks whether the
+          // first boundary after a mid-album start behaves differently.
+          if ('{{.StartMode}}' === 'startWith') {
+            await m().setQueue({ items: tracks, startWith: START });
+          } else {
+            await m().setQueue({ items: tracks });
+            if (START > 0) await m().changeToMediaAtIndex(START);
+          }
+          RESULT.startMode = '{{.StartMode}}';
+          RESULT.shiftMs = {{.ShiftMs}};
           try { await m().play(); } catch (e) { await m().stop().catch(() => {}); await m().play(); }
           if (!await waitFor(() => m().playbackState === 2, 25000)) { fail('start', 'never reached playing'); flush(); return; }
           RESULT.playStartWall = Date.now();
@@ -126,6 +205,7 @@
             m().addEventListener('nowPlayingItemDidChange', onItem);
             m().addEventListener('playbackStateDidChange', onState);
 
+            const b = {};
             const durS = (tracks[idx].attributes?.durationInMillis ?? 0) / 1000;
             // Natural mode never seeks: the boundary arrives the way it does in
             // real listening. Seek mode crosses the Preloader's 30% threshold
@@ -133,9 +213,11 @@
             // to LEAD_S before the end, so a long track costs seconds.
             const natural = NATURAL || k === 0 && durS < 90;
             if (!natural && durS > LEAD_S + 10) {
+              b.seek35Wall = Date.now();
               await m().seekToTime(durS * 0.35).catch(e => fail('seek35', e));
               await sleep(5000);
               timeline.push(snap('before-seek-end'));
+              b.seekEndWall = Date.now();
               await m().seekToTime(Math.max(0, durS - LEAD_S)).catch(e => fail('seekEnd', e));
             }
             const crossed = await waitFor(() => m().nowPlayingItem?.id === toId, (natural ? durS + 30 : LEAD_S + 30) * 1000);
@@ -151,7 +233,7 @@
             // lined up when it got there.
             const before = timeline.filter(e => e.item === fromId).pop() ?? null;
             RESULT.boundaries.push({
-              k, fromIdx: idx, fromId, toId, natural, crossed, crossWall,
+              ...b, k, fromIdx: idx, fromId, toId, natural, crossed, crossWall,
               distinctMediaSrcs: srcs.size,
               mediaElements: Math.max(0, ...timeline.map(e => e.media.length)),
               seamlessEnabled: before?.seamless ?? null,
@@ -163,6 +245,7 @@
           }
 
           await m().stop().catch(() => {});
+          RESULT.events = window.__ev;
           flush();
         } catch (e) {
           fail('top', e);

@@ -9,7 +9,9 @@
 //	VIBEZ_PROBE=1 VIBEZ_PROBE_ALBUM=1065973699 \
 //	  go test ./internal/player/cdp -run TestProbeSeamless -v -count=1 -timeout 20m
 //
-// Knobs: VIBEZ_PROBE_START (0-based track index, default 0), VIBEZ_PROBE_COUNT
+// Knobs: VIBEZ_PROBE_STARTMODE (changeTo, as vibez does, or startWith),
+// VIBEZ_PROBE_SHIFT_MS (start each next song this much earlier),
+// VIBEZ_PROBE_START (0-based track index, default 0), VIBEZ_PROBE_COUNT
 // (boundaries to cross, default 4), VIBEZ_PROBE_NATURAL=1 (never seek; real
 // listening, real duration), VIBEZ_PROBE_FEATURES (comma list passed to
 // MusicKit.configure, e.g. "-seamless-audio-transitions" for the control arm),
@@ -86,6 +88,16 @@ func TestProbeSeamless(t *testing.T) {
 	}
 
 	count := seamlessEnvInt("VIBEZ_PROBE_COUNT", 4)
+	startMode := "changeTo"
+	if os.Getenv("VIBEZ_PROBE_STARTMODE") == "startWith" {
+		startMode = "startWith"
+	}
+	shiftMs := 0.0
+	if v := os.Getenv("VIBEZ_PROBE_SHIFT_MS"); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil && f >= 0 {
+			shiftMs = f
+		}
+	}
 	featuresJSON, _ := json.Marshal(features)
 	tmpl, err := template.New("probeSeamless").Parse(probeSeamlessHTML)
 	if err != nil {
@@ -103,6 +115,8 @@ func TestProbeSeamless(t *testing.T) {
 		"FeaturesJSON":   string(featuresJSON),
 		"LeadSeconds":    seamlessEnvInt("VIBEZ_PROBE_LEAD", 6),
 		"TailMs":         seamlessEnvInt("VIBEZ_PROBE_TAIL", 3000),
+		"StartMode":      startMode,
+		"ShiftMs":        shiftMs,
 	}); err != nil {
 		t.Fatalf("render probe: %v", err)
 	}
@@ -239,7 +253,7 @@ func TestProbeSeamless(t *testing.T) {
 		t.Logf("full result: %s   audio: %s", dest, wavPath)
 	}
 
-	t.Logf("MusicKit %s, features %v", r.MusicKitVersion, features)
+	t.Logf("MusicKit %s, features %v, start %s, shift %.1f ms", r.MusicKitVersion, features, r.StartMode, r.ShiftMs)
 	for _, b := range r.Boundaries {
 		name := func(id string) string {
 			for _, tr := range r.Tracks {
@@ -274,7 +288,12 @@ type seamlessResult struct {
 	MusicKitVersion string   `json:"musickitVersion"`
 	Features        []string `json:"features"`
 	PlayStartWall   int64    `json:"playStartWall"`
-	Tracks          []struct {
+	StartMode       string   `json:"startMode"`
+	ShiftMs         float64  `json:"shiftMs"`
+	// Every append, timestampOffset write, key update and media-element
+	// event, from the instrumentation in probe_seamless.html.
+	Events json.RawMessage `json:"events"`
+	Tracks []struct {
 		I     int    `json:"i"`
 		ID    string `json:"id"`
 		Name  string `json:"name"`
@@ -288,6 +307,8 @@ type seamlessResult struct {
 		Natural             bool            `json:"natural"`
 		Crossed             bool            `json:"crossed"`
 		CrossWall           int64           `json:"crossWall"`
+		Seek35Wall          int64           `json:"seek35Wall,omitempty"`
+		SeekEndWall         int64           `json:"seekEndWall,omitempty"`
 		DistinctSrcs        int             `json:"distinctMediaSrcs"`
 		MediaElements       int             `json:"mediaElements"`
 		SeamlessEnabled     *bool           `json:"seamlessEnabled"`
